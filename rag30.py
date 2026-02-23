@@ -188,9 +188,32 @@ ORG_ENTITY_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     "Росгвардия": ("росгвард", "национальн", "гвард"),
 }
 
+ENTITY_LAW_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "Верховный Суд РФ": ("верховном суде", "о судебной системе"),
+    "Конституционный Суд РФ": ("конституционном суде", "конституционного суда"),
+    "Районный суд": ("о судах общей юрисдикции",),
+    "Мировые судьи": ("о мировых судьях",),
+    "Арбитражные суды": ("об арбитражных судах",),
+    "Апелляционные суды общей юрисдикции": ("о судах общей юрисдикции", "апелляционного суда общей юрисдикции"),
+    "Кассационные суды общей юрисдикции": ("о судах общей юрисдикции", "кассационного суда общей юрисдикции"),
+    "МВД РФ": ("о полиции", "внутренних дел"),
+    "Следственный комитет РФ": ("о следственном комитете", "ск рф"),
+    "ФСБ РФ": ("о федеральной службе безопасности", "фсб"),
+    "СВР РФ": ("о внешней разведке", "свр"),
+    "Прокуратура РФ": ("о прокуратуре",),
+    "ФСИН РФ": ("уголовно-исполнительной системе", "исполнения наказаний", "фсин"),
+    "Росгвардия": ("национальной гвардии", "росгвард"),
+}
+
+ORG_PROFILE_INTENT_MARKERS = (
+    "правов", "основ", "полномоч", "структур", "подотчет", "подотчетн",
+    "формирован", "место в системе", "определен",
+)
+
 GENERIC_QUERY_TOKENS = {
     "вопрос", "основан", "согласн", "поряд", "договор", "прав", "обязан", "ответствен",
     "стат", "пункт", "российск", "федерац", "кодекс", "работник", "работодател",
+    "правов", "основ", "деятельн", "структур", "полномоч", "орган", "государствен", "власт",
 }
 
 RU_STOPWORDS = {
@@ -387,14 +410,56 @@ def infer_law_hints(query: str) -> Set[str]:
 def extract_entity_tokens(query: str) -> Set[str]:
     q_tokens = tokenize(query)
     entities: Set[str] = set()
-    for keywords in ORG_ENTITY_KEYWORDS.values():
-        if all(any(t.startswith(kw) or kw.startswith(t) for t in q_tokens) for kw in keywords):
-            entities.update(keywords)
-            continue
-        partial = sum(1 for kw in keywords if any(t.startswith(kw) or kw.startswith(t) for t in q_tokens))
-        if partial >= max(1, len(keywords) - 1):
-            entities.update(keywords)
+    for entity in extract_entity_profiles(query):
+        entities.update(ORG_ENTITY_KEYWORDS.get(entity, ()))
     return entities
+
+
+def extract_entity_profiles(query: str) -> Set[str]:
+    q_tokens = tokenize(query)
+    if not q_tokens:
+        return set()
+
+    scored: List[Tuple[float, int, float, str]] = []
+    for entity_name, keywords in ORG_ENTITY_KEYWORDS.items():
+        matched = sum(1 for kw in keywords if any(t.startswith(kw) or kw.startswith(t) for t in q_tokens))
+        if matched <= 0:
+            continue
+        ratio = matched / max(1, len(keywords))
+        # full_match_priority, matched_count, ratio, entity_name
+        scored.append((1.0 if matched == len(keywords) else 0.0, matched, ratio, entity_name))
+
+    if not scored:
+        return set()
+
+    full = {entity for is_full, _, _, entity in scored if is_full >= 1.0}
+    if full:
+        return full
+
+    best_ratio = max(ratio for _, _, ratio, _ in scored)
+    threshold = max(0.67, best_ratio - 0.10)
+    picked = {
+        entity
+        for _, matched, ratio, entity in scored
+        if ratio >= threshold and matched >= 2
+    }
+    if picked:
+        return picked
+    # fallback: best single match entity for very short/abbreviation queries
+    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    return {scored[0][3]}
+
+
+def collect_entity_law_markers(entity_profiles: Set[str]) -> Set[str]:
+    markers: Set[str] = set()
+    for entity in entity_profiles:
+        markers.update(ENTITY_LAW_MARKERS.get(entity, ()))
+    return markers
+
+
+def is_org_profile_intent(query: str) -> bool:
+    q = normalize_text(query)
+    return any(marker in q for marker in ORG_PROFILE_INTENT_MARKERS)
 
 
 def extract_article_hints(query: str) -> Set[str]:
@@ -564,6 +629,7 @@ class OtusStyleRAG:
         )
         self.use_llm_query_expansion = use_llm_query_expansion
         self.system_prompt = load_prompt_template(prompt_path)
+        self.last_llm_query = ""
 
     @staticmethod
     def _build_law_buckets(docs: Iterable[Document]) -> Dict[str, List[Document]]:
@@ -644,6 +710,8 @@ class OtusStyleRAG:
         law_hints: Set[str],
         query_tokens: Optional[Set[str]] = None,
         allow_federal_supplement: bool = False,
+        entity_law_markers: Optional[Set[str]] = None,
+        org_profile_intent: bool = False,
     ) -> Callable[[Dict[str, Any]], bool]:
         def _filter(metadata: Dict[str, Any]) -> bool:
             md = metadata or {}
@@ -654,17 +722,30 @@ class OtusStyleRAG:
                 if not is_practice_metadata(md):
                     return False
 
+            source_type = normalize_text(str(md.get("source_type", "")))
+            title = normalize_text(str(md.get("source_title", "")))
+            hierarchy = normalize_text(str(md.get("hierarchy_str", "")))
+            law_id = normalize_law_code(str(md.get("law_id", "")))
+            combined = f"{law_id} {title} {hierarchy} {source_type}"
+            marker_hit = bool(entity_law_markers and any(marker in combined for marker in entity_law_markers))
+
+            if org_profile_intent and channel == "law":
+                # Для вопросов по госорганам повышаем шанс профильных ФЗ/ФКЗ.
+                if marker_hit:
+                    return True
+                if "кодекс" in source_type:
+                    return False
+                if query_tokens:
+                    metadata_tokens = tokenize(f"{md.get('law_id', '')} {md.get('source_title', '')} {md.get('hierarchy_str', '')}")
+                    if query_tokens.intersection(metadata_tokens):
+                        return True
+
             if not law_hints:
                 return True
 
             canonical_codes = canonical_law_codes_from_metadata(md)
             if canonical_codes.intersection(law_hints):
                 return True
-
-            law_id = normalize_law_code(str(md.get("law_id", "")))
-            title = normalize_text(str(md.get("source_title", "")))
-            hierarchy = normalize_text(str(md.get("hierarchy_str", "")))
-            combined = f"{law_id} {title} {hierarchy}"
 
             for hint in law_hints:
                 if hint in law_id:
@@ -674,8 +755,9 @@ class OtusStyleRAG:
                         return True
 
             if allow_federal_supplement and channel == "law":
-                source_type = normalize_text(str(md.get("source_type", "")))
                 if "федеральный закон" in source_type or "федеральный конституционный закон" in source_type:
+                    if marker_hit:
+                        return True
                     if not query_tokens:
                         return True
                     metadata_tokens = tokenize(
@@ -696,6 +778,8 @@ class OtusStyleRAG:
         q_norm = normalize_text(question)
         q_tokens = tokenize(question)
         entity_tokens = extract_entity_tokens(question)
+        entity_profiles = extract_entity_profiles(question)
+        entity_markers = collect_entity_law_markers(entity_profiles)
 
         if law_hints:
             code_phrase = {
@@ -720,6 +804,11 @@ class OtusStyleRAG:
             variants.append(" ".join(focus[:6]))
         if entity_tokens:
             variants.append(" ".join(sorted(entity_tokens)) + " правовая основа полномочия структура")
+        if entity_profiles:
+            for profile in sorted(entity_profiles):
+                variants.append(f"{profile} правовая основа полномочия структура федеральный закон фкз")
+        if entity_markers:
+            variants.append(" ".join(sorted(entity_markers)[:6]))
 
         if "инициативе работодателя" in q_norm:
             variants.append("расторжение трудового договора по инициативе работодателя статья 81 тк рф")
@@ -818,6 +907,8 @@ class OtusStyleRAG:
         law_hints: Set[str],
         query_tokens: Optional[Set[str]] = None,
         allow_federal_supplement: bool = False,
+        entity_law_markers: Optional[Set[str]] = None,
+        org_profile_intent: bool = False,
     ) -> List[Document]:
         if channel == "law":
             k, fetch_k, lambda_mult = LAW_K, LAW_FETCH_K, LAW_LAMBDA
@@ -829,6 +920,8 @@ class OtusStyleRAG:
             law_hints=law_hints,
             query_tokens=query_tokens,
             allow_federal_supplement=allow_federal_supplement,
+            entity_law_markers=entity_law_markers,
+            org_profile_intent=org_profile_intent,
         )
 
         try:
@@ -933,7 +1026,11 @@ class OtusStyleRAG:
 
     def retrieve(self, question: str, top_k: int = 8) -> Tuple[List[Document], RetrievalDebug]:
         explicit_law_hints = extract_law_hints(question)
+        entity_profiles = extract_entity_profiles(question)
+        org_profile_intent = bool(entity_profiles) and is_org_profile_intent(question)
         inferred_law_hints = infer_law_hints(question) if not explicit_law_hints else set()
+        if org_profile_intent and not explicit_law_hints:
+            inferred_law_hints = set()
         law_hints = set(explicit_law_hints or inferred_law_hints)  # for scoring/debug
 
         # Жесткий фильтр по кодексу используем только если кодекс явно указан в вопросе.
@@ -942,10 +1039,11 @@ class OtusStyleRAG:
         variants = self._generate_query_variants(question, max_variants=4, law_hints=law_hints)
         query_tokens = tokenize(question)
         entity_tokens = extract_entity_tokens(question)
+        entity_law_markers = collect_entity_law_markers(entity_profiles)
         focus_tokens = {t for t in query_tokens if len(t) >= 5 and t not in GENERIC_QUERY_TOKENS and t not in RU_STOPWORDS}
         practice_intent = self._is_practice_intent(question)
         federal_law_intent = has_federal_law_intent(question)
-        allow_federal_supplement = bool(explicit_law_hints) or federal_law_intent
+        allow_federal_supplement = bool(explicit_law_hints) or federal_law_intent or org_profile_intent
 
         law_runs: List[List[Document]] = []
         practice_runs: List[List[Document]] = []
@@ -958,6 +1056,8 @@ class OtusStyleRAG:
                     law_hints=retrieval_law_hints,
                     query_tokens=query_tokens,
                     allow_federal_supplement=allow_federal_supplement,
+                    entity_law_markers=entity_law_markers,
+                    org_profile_intent=org_profile_intent,
                 )
             )
             if practice_intent:
@@ -968,6 +1068,8 @@ class OtusStyleRAG:
                         law_hints=retrieval_law_hints,
                         query_tokens=query_tokens,
                         allow_federal_supplement=allow_federal_supplement,
+                        entity_law_markers=entity_law_markers,
+                        org_profile_intent=org_profile_intent,
                     )
                 )
 
@@ -1001,6 +1103,10 @@ class OtusStyleRAG:
         for idx, doc in enumerate(fused):
             md = doc.metadata or {}
             header = normalize_text(f"{md.get('source_title', '')} {md.get('hierarchy_str', '')}")
+            source_type_norm = normalize_text(str(md.get("source_type", "")))
+            meta_blob = normalize_text(
+                f"{md.get('law_id', '')} {md.get('source_title', '')} {md.get('hierarchy_str', '')} {md.get('source_type', '')}"
+            )
             body = normalize_text(doc.page_content[:1200])
             header_tokens = tokenize(header)
             body_tokens = tokenize(body)
@@ -1029,7 +1135,29 @@ class OtusStyleRAG:
                 if doc_codes.intersection(law_hints):
                     score += 0.8
                 else:
-                    score -= 1.2
+                    penalty = 1.2 if explicit_law_hints else 0.2
+                    if org_profile_intent:
+                        penalty = min(penalty, 0.1)
+                    score -= penalty
+
+            if org_profile_intent:
+                if "федеральный конституционный закон" in source_type_norm:
+                    score += 1.1
+                elif "федеральный закон" in source_type_norm:
+                    score += 0.9
+                elif "конституция" in source_type_norm:
+                    score += 0.7
+                elif "кодекс" in source_type_norm:
+                    score -= 0.55
+
+            if entity_law_markers:
+                if any(marker in meta_blob for marker in entity_law_markers):
+                    score += 1.3
+                elif org_profile_intent and (
+                    "федеральный закон" in source_type_norm
+                    or "федеральный конституционный закон" in source_type_norm
+                ):
+                    score -= 0.25
 
             rescored.append((score, -idx, doc))
 
@@ -1128,17 +1256,14 @@ class OtusStyleRAG:
             parts.append(f"{header}\n{doc.page_content}")
         return "\n\n".join(parts)
 
-    def answer(self, question: str, docs: List[Document]) -> str:
-        if not docs:
-            return (
-                "В базе не найдено достаточно релевантных фрагментов. "
-                "Уточните вопрос и, по возможности, укажите кодекс/статью."
-            )
-
-        prompt = f"""
+    def build_answer_prompt(self, question: str, docs: List[Document]) -> str:
+        return f"""
 Работай только по переданному контексту.
 Если в вопросе есть тест с вариантами — выбери только один правильный вариант и обоснуй нормой.
 Всегда указывай ссылки на источники в формате [S1], [S2] и при возможности давай ссылку на consultant.ru.
+Не проси уточнить вопрос, если в контексте есть хотя бы один релевантный фрагмент.
+Для каждого правового тезиса ставь ссылку [S#] в конце предложения.
+Если источников несколько, используй минимум две ссылки [S#] в ответе.
 Если контекста недостаточно — явно укажи это.
 
 Структура ответа:
@@ -1154,6 +1279,17 @@ class OtusStyleRAG:
 Вопрос:
 {question}
 """
+
+    def answer(self, question: str, docs: List[Document]) -> str:
+        if not docs:
+            self.last_llm_query = ""
+            return (
+                "В базе не найдено достаточно релевантных фрагментов. "
+                "Уточните вопрос и, по возможности, укажите кодекс/статью."
+            )
+
+        prompt = self.build_answer_prompt(question, docs)
+        self.last_llm_query = prompt
         messages = [
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=prompt),
