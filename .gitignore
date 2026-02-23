@@ -33,6 +33,10 @@ db/
 *.faiss
 *.bin
 
+# Env files
+config.env
+.env
+
 # Data folders
 laws/
 NPA3001/
