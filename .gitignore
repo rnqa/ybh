@@ -75,3 +75,16 @@ laws/
 NPA3001/
 r2r/
 R2R Yorist/
+
+# Generated data (local only)
+Laws/
+NPA3001/
+diagnostics/
+rag_history/
+rag_history.jsonl
+rag30.log
+faiss_indexes/
+embeddings/
+logs/
+laws_rf_structured.jsonl
+output_fragments.jsonl
