@@ -184,7 +184,7 @@ def probe_reranker(rag: OtusStyleRAG, query: str, top_k: int) -> Dict[str, Any]:
     model = None
     if CrossEncoder is not None:
         try:
-            model = CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1", max_length=512)
+            model = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
         except Exception:
             model = None
 
@@ -198,7 +198,7 @@ def probe_reranker(rag: OtusStyleRAG, query: str, top_k: int) -> Dict[str, Any]:
         ranked = sorted(zip(scores, candidates), key=lambda x: float(x[0]), reverse=True)[:top_k]
         return {
             "enabled": True,
-            "model": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+            "model": "BAAI/bge-reranker-v2-m3",
             "top_docs": [serialize_doc(doc, i + 1, round(float(score), 6)) for i, (score, doc) in enumerate(ranked)],
         }
 
@@ -322,4 +322,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

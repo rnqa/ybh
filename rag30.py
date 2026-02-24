@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
+import heapq
 import importlib.util
 import json
 import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -41,10 +44,27 @@ except Exception as exc:  # pragma: no cover
     ChatOpenAI = None  # type: ignore[assignment]
 
 try:
-    from sentence_transformers import SentenceTransformer
+    from aiogram import Bot, Dispatcher, types
+    from aiogram.filters import CommandStart
+except Exception as exc:  # pragma: no cover
+    IMPORT_ERRORS["aiogram"] = exc
+    Bot = None  # type: ignore[assignment]
+    Dispatcher = None  # type: ignore[assignment]
+    types = None  # type: ignore[assignment]
+    CommandStart = None  # type: ignore[assignment]
+
+try:
+    from sentence_transformers import SentenceTransformer, CrossEncoder
 except Exception as exc:  # pragma: no cover
     IMPORT_ERRORS["sentence-transformers"] = exc
     SentenceTransformer = None  # type: ignore[assignment]
+    CrossEncoder = None  # type: ignore[assignment]
+
+try:
+    from rank_bm25 import BM25Okapi
+except Exception as exc:  # pragma: no cover
+    IMPORT_ERRORS["rank-bm25"] = exc
+    BM25Okapi = None  # type: ignore[assignment]
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -70,6 +90,11 @@ logger = logging.getLogger("rag30")
 LAW_WEIGHT = 0.70
 PRACTICE_WEIGHT = 0.30
 RRF_K = 60
+VECTOR_FETCH_K = 120
+BM25_FETCH_K = 120
+RERANK_CANDIDATES = 80
+RERANK_TOP_K = 8
+RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 
 LAW_K = 20
 LAW_FETCH_K = 80
@@ -122,6 +147,38 @@ LAW_HINT_TOKENS: Dict[str, Tuple[str, ...]] = {
     "APK": ("арбитраж", "процесс", "апк"),
     "KOAP": ("административ", "коап"),
 }
+
+TEXTBOOK_MARKERS = (
+    "учебник",
+    "учебное пособие",
+    "курс лекций",
+    "учеб",
+)
+
+EDU_INTENT_MARKERS = (
+    "объясни",
+    "простыми словами",
+    "для экзамена",
+    "для семинара",
+    "конспект",
+    "теория",
+    "учебник",
+    "учебное пособие",
+)
+
+NORMATIVE_INTENT_MARKERS = (
+    "статья",
+    "ст.",
+    "кодекс",
+    "фз",
+    "фкз",
+    "конституц",
+    "норма",
+    "пункт",
+    "часть",
+    "постановлен",
+    "пленум",
+)
 
 LAW_HINT_TITLE_PATTERNS: Dict[str, Tuple[str, ...]] = {
     "TK": (r"трудов(ой|ого)?\s+кодекс", r"\bтк\b"),
@@ -232,43 +289,24 @@ RU_SUFFIXES = (
 )
 
 STUDENT_SYSTEM_PROMPT = """
-Ты — цифровой юридический ассистент для студентов юридических вузов России.
+Ты — строгий юридический ассистент по праву РФ.
 
-Роль:
-- Помогай в обучении: объясняй нормы права, разбирай правовые задачи, решай тестовые вопросы,
-  подсказывай структуру правовых алгоритмов, помогай готовиться к семинарам и экзаменам.
-- Ты не заменяешь преподавателя, а объясняешь право понятно и структурно.
+Ключевое правило:
+- Отвечай только на основе переданного контекста. Никаких предположений и внешних знаний.
 
-Принципы:
-1. Источник информации:
-- Основывай ответ исключительно на действующем законодательстве РФ:
-  Конституция РФ, кодексы, федеральные законы, подзаконные акты, постановления Пленума ВС РФ.
-- Указывай точные ссылки на статьи и по возможности давай ссылку на consultant.ru.
-- Если применяется несколько норм — объясняй их взаимосвязь и логику.
+Требования к источникам:
+- Если в контексте нет нормы или факта, прямо скажи: "Информации недостаточно."
+- Не ссылайся на нормы, статьи и источники, которых нет в контексте.
+- Для каждого правового тезиса указывай ссылку на источник в формате [S1], [S2].
+- Если в контексте есть ссылка на источник (например, consultant.ru), можешь упомянуть ее. Иначе не добавляй ссылки.
 
-2. Стиль:
-- Доброжелательно, понятно, педагогично.
-- Юридические термины объясняй простыми словами.
-- Без излишней формализации.
-
-3. Форматирование по типу запроса:
-- Разъяснение нормы: кратко + объяснение простыми словами + ссылка на норму.
-- Правовой вопрос: прямой ответ + статья/часть/пункт + краткое обоснование.
-- Тест с вариантами: выбери только один правильный вариант, затем обоснование с нормой.
-- Разбор задачи: квалификация/правовая оценка + соответствующие нормы.
-- Алгоритм действий: пошаговый список с правовыми основаниями.
-
-Ограничения:
-- Не помогай нарушать правила учебного процесса.
-- Не искажай смысл норм и не давай субъективных трактовок.
-- Не советуй ничего, что нарушает законы РФ.
-- Если вопрос не о праве РФ — прямо сообщи, что специализация только по праву РФ.
-
-Важно:
-- Не ссылайся на источники, которых нет в переданном контексте.
-- Если данных в контексте недостаточно, прямо укажи это.
-- В конце ответа обязательно добавляй фразу:
-  "Этот ответ основан на действующем законодательстве РФ и предназначен для учебных целей. Для уточнения текста нормы — проверьте её на consultant.ru или проконсультируйтесь с преподавателем."
+Структура ответа:
+1) Краткий вывод.
+2) Правовое обоснование с логикой применения норм.
+3) При необходимости — алгоритм действий/шаги.
+4) Ограничения ответа (если есть).
+5) Финальная фраза:
+   "Этот ответ основан на действующем законодательстве РФ и предназначен для учебных целей. Для уточнения текста нормы — проверьте её на consultant.ru или проконсультируйтесь с преподавателем."
 """.strip()
 
 
@@ -289,6 +327,7 @@ def check_runtime_dependencies() -> None:
         "langchain-community": "langchain_community",
         "langchain-openai": "langchain_openai",
         "sentence-transformers": "sentence_transformers",
+        "rank-bm25": "rank_bm25",
         "faiss-cpu": "faiss",
     }
     missing = [pkg for pkg, mod in required_specs.items() if importlib.util.find_spec(mod) is None]
@@ -307,7 +346,7 @@ def check_runtime_dependencies() -> None:
     print(f"  \"{py}\" -m pip install --upgrade pip")
     print(
         f"  \"{py}\" -m pip install "
-        "langchain-core langchain-community langchain-openai sentence-transformers faiss-cpu"
+        "langchain-core langchain-community langchain-openai sentence-transformers rank-bm25 faiss-cpu"
     )
     raise SystemExit(1)
 
@@ -481,16 +520,45 @@ def has_federal_law_intent(query: str) -> bool:
     )
 
 
-def tokenize(text: str) -> Set[str]:
-    def normalize_token(token: str) -> str:
-        t = token.lower().replace("ё", "е")
-        if len(t) <= 3 or t.isdigit():
-            return t
-        for suffix in RU_SUFFIXES:
-            if len(t) > len(suffix) + 2 and t.endswith(suffix):
-                return t[: -len(suffix)]
-        return t
+def is_textbook_metadata(metadata: Dict[str, Any]) -> bool:
+    md = metadata or {}
+    source_type = normalize_text(str(md.get("source_type", "")))
+    source_title = normalize_text(str(md.get("source_title", "")))
+    law_id = normalize_text(str(md.get("law_id", "")))
+    if any(marker in source_type for marker in TEXTBOOK_MARKERS):
+        return True
+    if any(marker in source_title for marker in TEXTBOOK_MARKERS):
+        return True
+    if "uch" in law_id:
+        return True
+    return False
 
+
+def detect_source_policy(
+    question: str,
+    explicit_law_hints: Set[str],
+    article_hints: Set[str],
+) -> str:
+    q = normalize_text(question)
+    is_edu = any(marker in q for marker in EDU_INTENT_MARKERS)
+    is_norm = any(marker in q for marker in NORMATIVE_INTENT_MARKERS)
+    if explicit_law_hints or article_hints or is_norm:
+        return "exclude_textbooks"
+    if is_edu:
+        return "prefer_textbooks"
+    return "allow_all"
+
+def normalize_token(token: str) -> str:
+    t = token.lower().replace("ё", "е")
+    if len(t) <= 3 or t.isdigit():
+        return t
+    for suffix in RU_SUFFIXES:
+        if len(t) > len(suffix) + 2 and t.endswith(suffix):
+            return t[: -len(suffix)]
+    return t
+
+
+def tokenize(text: str) -> Set[str]:
     tokens: Set[str] = set()
     for raw in TOKEN_RE.findall(normalize_text(text)):
         lowered = raw.lower().replace("ё", "е")
@@ -500,6 +568,19 @@ def tokenize(text: str) -> Set[str]:
         if token in RU_STOPWORDS:
             continue
         tokens.add(token)
+    return tokens
+
+
+def tokenize_bm25(text: str) -> List[str]:
+    tokens: List[str] = []
+    for raw in TOKEN_RE.findall(normalize_text(text)):
+        lowered = raw.lower().replace("ё", "е")
+        if lowered in RU_STOPWORDS:
+            continue
+        token = normalize_token(lowered)
+        if token in RU_STOPWORDS:
+            continue
+        tokens.append(token)
     return tokens
 
 
@@ -544,7 +625,7 @@ def is_law_metadata(metadata: Dict[str, Any]) -> bool:
 class LaBSEEmbeddings(Embeddings):
     def __init__(self, model_name: str = "cointegrated/LaBSE-en-ru"):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name, device="cuda")
         logger.info("Embeddings model loaded: %s", model_name)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -571,6 +652,12 @@ class RetrievalDebug:
     practice_docs: int
     lexical_law_docs: int
     final_docs: int
+    vector_docs: int = 0
+    bm25_docs: int = 0
+    fused_docs: int = 0
+    rerank_model: str = ""
+    source_policy: str = ""
+    textbook_docs: int = 0
 
 
 class OtusStyleRAG:
@@ -630,6 +717,19 @@ class OtusStyleRAG:
         self.use_llm_query_expansion = use_llm_query_expansion
         self.system_prompt = load_prompt_template(prompt_path)
         self.last_llm_query = ""
+        self.last_retrieval: Dict[str, Any] = {}
+        self.history_dir = Path("rag_history")
+        self.history_path = self.history_dir / "local.jsonl"
+        self.last_llm_usage: Dict[str, Any] = {}
+
+        self._bm25: Optional[Any] = None
+        self._bm25_docs: List[Document] = []
+        self._bm25_doc_ids: List[str] = []
+        self._bm25_ready = False
+        self._reranker: Optional[Any] = None
+        self._reranker_attempted = False
+
+        self._build_bm25_index()
 
     @staticmethod
     def _build_law_buckets(docs: Iterable[Document]) -> Dict[str, List[Document]]:
@@ -703,6 +803,190 @@ class OtusStyleRAG:
             self.vector_store.docstore._dict[key] = Document(page_content=clean_doc.page_content, metadata=merged_md)
             replaced += 1
         return replaced
+
+    def _build_bm25_index(self) -> None:
+        if BM25Okapi is None:
+            logger.warning("BM25 unavailable: rank-bm25 not installed.")
+            return
+
+        docs: List[Document] = []
+        doc_ids: List[str] = []
+        corpus_tokens: List[List[str]] = []
+        for doc in self.docs:
+            if not is_informative_text(doc.page_content):
+                continue
+            md = doc.metadata or {}
+            text = (
+                f"{md.get('source_title','')} {md.get('hierarchy_str','')} "
+                f"{md.get('law_id','')} {doc.page_content}"
+            )
+            tokens = tokenize_bm25(text)
+            if not tokens:
+                continue
+            docs.append(doc)
+            doc_ids.append(stable_doc_id(doc))
+            corpus_tokens.append(tokens)
+
+        if not corpus_tokens:
+            logger.warning("BM25 index not built: empty corpus.")
+            return
+
+        self._bm25 = BM25Okapi(corpus_tokens)
+        self._bm25_docs = docs
+        self._bm25_doc_ids = doc_ids
+        self._bm25_ready = True
+        logger.info("BM25 index ready: docs=%s", len(self._bm25_docs))
+
+    @staticmethod
+    def _doc_text_for_rerank(doc: Document) -> str:
+        md = doc.metadata or {}
+        return f"{md.get('source_title','')} {md.get('hierarchy_str','')} {doc.page_content[:1800]}"
+
+    def _vector_search(self, query: str, k: int) -> List[Tuple[Document, float]]:
+        try:
+            results = self.vector_store.similarity_search_with_score(query, k=k)
+        except Exception as exc:
+            logger.warning("Vector search failed: %s", exc)
+            return []
+
+        out: List[Tuple[Document, float]] = []
+        for doc, distance in results:
+            if not is_informative_text(doc.page_content):
+                continue
+            score = 1.0 / (1.0 + float(distance))
+            out.append((doc, score))
+        return out
+
+    def _bm25_search(self, query: str, top_k: int) -> List[Tuple[Document, float]]:
+        if not self._bm25_ready or self._bm25 is None:
+            return []
+        tokens = tokenize_bm25(query)
+        if not tokens:
+            return []
+        scores = self._bm25.get_scores(tokens)
+        if scores is None or len(scores) == 0:
+            return []
+        top_indices = heapq.nlargest(top_k, range(len(scores)), key=scores.__getitem__)
+        out: List[Tuple[Document, float]] = []
+        for idx in top_indices:
+            score = float(scores[idx])
+            if score <= 0.0:
+                continue
+            out.append((self._bm25_docs[idx], score))
+        return out
+
+    def _get_reranker(self) -> Optional[Any]:
+        if self._reranker_attempted:
+            return self._reranker
+        self._reranker_attempted = True
+        if CrossEncoder is None:
+            return None
+        try:
+            self._reranker = CrossEncoder(RERANK_MODEL, max_length=512, device="cuda")
+            logger.info("Reranker enabled: %s", RERANK_MODEL)
+        except Exception as exc:
+            logger.warning("Reranker unavailable, fallback lexical: %s", exc)
+            self._reranker = None
+        return self._reranker
+
+    def _rerank_candidates(self, query: str, candidates: List[Document]) -> Tuple[List[Document], Dict[str, float], str]:
+        if not candidates:
+            return [], {}, "none"
+
+        model = self._get_reranker()
+        score_map: Dict[str, float] = {}
+        if model is not None:
+            try:
+                pairs = [(query, self._doc_text_for_rerank(doc)) for doc in candidates]
+                scores = model.predict(pairs, batch_size=16, show_progress_bar=False)
+                for doc, score in zip(candidates, scores):
+                    score_map[stable_doc_id(doc)] = float(score)
+                ranked = sorted(
+                    candidates,
+                    key=lambda d: score_map.get(stable_doc_id(d), 0.0),
+                    reverse=True,
+                )
+                return ranked, score_map, RERANK_MODEL
+            except Exception as exc:
+                logger.warning("Reranker failed, fallback lexical: %s", exc)
+
+        q_tokens = tokenize(query)
+        for doc in candidates:
+            score_map[stable_doc_id(doc)] = len(tokenize(self._doc_text_for_rerank(doc)).intersection(q_tokens))
+        ranked = sorted(candidates, key=lambda d: score_map.get(stable_doc_id(d), 0.0), reverse=True)
+        return ranked, score_map, "lexical_fallback"
+
+    @staticmethod
+    def _rrf_merge(
+        lists_of_docs: List[List[Document]],
+        weights: Optional[List[float]] = None,
+    ) -> Tuple[List[Document], Dict[str, float]]:
+        scores: Dict[str, float] = {}
+        docs: Dict[str, Document] = {}
+
+        if weights is None:
+            weights = [1.0] * len(lists_of_docs)
+
+        for docs_list, weight in zip(lists_of_docs, weights):
+            for rank, doc in enumerate(docs_list, start=1):
+                doc_id = stable_doc_id(doc)
+                scores[doc_id] = scores.get(doc_id, 0.0) + weight / (RRF_K + rank)
+                docs[doc_id] = doc
+
+        ranked_ids = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
+        return [docs[i] for i in ranked_ids], scores
+
+    @staticmethod
+    def _apply_candidate_boost(
+        docs: List[Document],
+        rrf_scores: Dict[str, float],
+        law_hints: Set[str],
+        explicit_law_hints: Set[str],
+        entity_law_markers: Set[str],
+        article_hints: Set[str],
+        org_profile_intent: bool,
+    ) -> List[Document]:
+        if not docs:
+            return docs
+        boosted: List[Tuple[float, int, Document]] = []
+        for idx, doc in enumerate(docs):
+            md = doc.metadata or {}
+            source_type = normalize_text(str(md.get("source_type", "")))
+            meta_blob = normalize_text(
+                f"{md.get('law_id', '')} {md.get('source_title', '')} {md.get('hierarchy_str', '')}"
+            )
+            header = normalize_text(f"{md.get('source_title', '')} {md.get('hierarchy_str', '')}")
+            doc_id = stable_doc_id(doc)
+            bonus = 0.0
+
+            if law_hints:
+                codes = canonical_law_codes_from_metadata(md)
+                if codes.intersection(law_hints):
+                    bonus += 0.25
+                elif explicit_law_hints:
+                    bonus -= 0.20
+
+            if entity_law_markers and any(marker in meta_blob for marker in entity_law_markers):
+                bonus += 0.30
+
+            if article_hints and any(article in header for article in article_hints):
+                bonus += 0.20
+
+            if org_profile_intent:
+                if "федеральный конституционный закон" in source_type:
+                    bonus += 0.25
+                elif "федеральный закон" in source_type:
+                    bonus += 0.20
+                elif "конституция" in source_type:
+                    bonus += 0.15
+                elif "кодекс" in source_type:
+                    bonus -= 0.15
+
+            base = rrf_scores.get(doc_id, 0.0)
+            boosted.append((base + bonus, -idx, doc))
+
+        boosted.sort(reverse=True)
+        return [doc for _, _, doc in boosted]
 
     def _make_metadata_filter(
         self,
@@ -987,242 +1271,102 @@ class OtusStyleRAG:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [doc for _, doc in scored]
 
-    @staticmethod
-    def _rrf_merge(lists_of_docs: List[List[Document]], weight: float = 1.0) -> List[Document]:
-        scores: Dict[str, float] = {}
-        docs: Dict[str, Document] = {}
-
-        for docs_list in lists_of_docs:
-            for rank, doc in enumerate(docs_list, start=1):
-                doc_id = stable_doc_id(doc)
-                scores[doc_id] = scores.get(doc_id, 0.0) + weight / (RRF_K + rank)
-                docs[doc_id] = doc
-
-        ranked_ids = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
-        return [docs[i] for i in ranked_ids]
-
-    def _weighted_channel_fusion(
+    def retrieve(
         self,
-        law_docs: List[Document],
-        practice_docs: List[Document],
-        law_weight: float,
-        practice_weight: float,
-    ) -> List[Document]:
-        scores: Dict[str, float] = {}
-        doc_map: Dict[str, Document] = {}
-
-        for rank, doc in enumerate(law_docs, start=1):
-            doc_id = stable_doc_id(doc)
-            scores[doc_id] = scores.get(doc_id, 0.0) + law_weight / (RRF_K + rank)
-            doc_map[doc_id] = doc
-
-        for rank, doc in enumerate(practice_docs, start=1):
-            doc_id = stable_doc_id(doc)
-            scores[doc_id] = scores.get(doc_id, 0.0) + practice_weight / (RRF_K + rank)
-            doc_map[doc_id] = doc
-
-        ranked = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
-        return [doc_map[i] for i in ranked]
-
-    def retrieve(self, question: str, top_k: int = 8) -> Tuple[List[Document], RetrievalDebug]:
+        question: str,
+        top_k: int = 8,
+        use_hybrid: bool = True,
+        use_rerank: bool = True,
+    ) -> Tuple[List[Document], RetrievalDebug]:
         explicit_law_hints = extract_law_hints(question)
         entity_profiles = extract_entity_profiles(question)
         org_profile_intent = bool(entity_profiles) and is_org_profile_intent(question)
         inferred_law_hints = infer_law_hints(question) if not explicit_law_hints else set()
         if org_profile_intent and not explicit_law_hints:
             inferred_law_hints = set()
-        law_hints = set(explicit_law_hints or inferred_law_hints)  # for scoring/debug
+        law_hints = set(explicit_law_hints or inferred_law_hints)
 
-        # Жесткий фильтр по кодексу используем только если кодекс явно указан в вопросе.
-        retrieval_law_hints = set(explicit_law_hints)
         article_hints = extract_article_hints(question)
         variants = self._generate_query_variants(question, max_variants=4, law_hints=law_hints)
-        query_tokens = tokenize(question)
         entity_tokens = extract_entity_tokens(question)
         entity_law_markers = collect_entity_law_markers(entity_profiles)
-        focus_tokens = {t for t in query_tokens if len(t) >= 5 and t not in GENERIC_QUERY_TOKENS and t not in RU_STOPWORDS}
-        practice_intent = self._is_practice_intent(question)
-        federal_law_intent = has_federal_law_intent(question)
-        allow_federal_supplement = bool(explicit_law_hints) or federal_law_intent or org_profile_intent
+        source_policy = detect_source_policy(question, explicit_law_hints, article_hints)
 
-        law_runs: List[List[Document]] = []
-        practice_runs: List[List[Document]] = []
+        vector_runs: List[List[Document]] = []
+        bm25_runs: List[List[Document]] = []
+
+        vector_doc_ids: Set[str] = set()
+        bm25_doc_ids: Set[str] = set()
 
         for variant in variants:
-            law_runs.append(
-                self._mmr_search(
-                    variant,
-                    channel="law",
-                    law_hints=retrieval_law_hints,
-                    query_tokens=query_tokens,
-                    allow_federal_supplement=allow_federal_supplement,
-                    entity_law_markers=entity_law_markers,
-                    org_profile_intent=org_profile_intent,
-                )
-            )
-            if practice_intent:
-                practice_runs.append(
-                    self._mmr_search(
-                        variant,
-                        channel="practice",
-                        law_hints=retrieval_law_hints,
-                        query_tokens=query_tokens,
-                        allow_federal_supplement=allow_federal_supplement,
-                        entity_law_markers=entity_law_markers,
-                        org_profile_intent=org_profile_intent,
-                    )
-                )
+            vec = self._vector_search(variant, k=max(VECTOR_FETCH_K, top_k * 8))
+            vec_docs = [doc for doc, _ in vec]
+            vector_runs.append(vec_docs)
+            vector_doc_ids.update(stable_doc_id(d) for d in vec_docs)
 
-        lexical_law = self._law_guided_lexical_search(
-            query_tokens=query_tokens,
-            focus_tokens=focus_tokens,
+            if use_hybrid:
+                bm25 = self._bm25_search(variant, top_k=max(BM25_FETCH_K, top_k * 8))
+                bm25_docs = [doc for doc, _ in bm25]
+                bm25_runs.append(bm25_docs)
+                bm25_doc_ids.update(stable_doc_id(d) for d in bm25_docs)
+
+        fusion_lists = vector_runs + bm25_runs if use_hybrid else vector_runs
+        fused_docs, rrf_scores = self._rrf_merge(fusion_lists) if fusion_lists else ([], {})
+        fused_docs = self._apply_candidate_boost(
+            fused_docs,
+            rrf_scores,
             law_hints=law_hints,
-            per_law=max(50, top_k * 10),
-        )
-        if lexical_law:
-            law_runs.append(lexical_law)
-
-        law_ranked = self._rrf_merge(law_runs, weight=1.0)
-        practice_ranked = self._rrf_merge(practice_runs, weight=1.0)
-        if practice_intent:
-            law_weight = LAW_WEIGHT
-            practice_weight = PRACTICE_WEIGHT
-        else:
-            law_weight = 0.92
-            practice_weight = 0.08
-
-        fused = self._weighted_channel_fusion(
-            law_ranked,
-            practice_ranked,
-            law_weight=law_weight,
-            practice_weight=practice_weight,
+            explicit_law_hints=explicit_law_hints,
+            entity_law_markers=entity_law_markers,
+            article_hints=article_hints,
+            org_profile_intent=org_profile_intent,
         )
 
-        # Повышаем статьи и пункты, которые ближе к теме запроса.
-        rescored: List[Tuple[float, int, Document]] = []
-        for idx, doc in enumerate(fused):
-            md = doc.metadata or {}
-            header = normalize_text(f"{md.get('source_title', '')} {md.get('hierarchy_str', '')}")
-            source_type_norm = normalize_text(str(md.get("source_type", "")))
-            meta_blob = normalize_text(
-                f"{md.get('law_id', '')} {md.get('source_title', '')} {md.get('hierarchy_str', '')} {md.get('source_type', '')}"
-            )
-            body = normalize_text(doc.page_content[:1200])
-            header_tokens = tokenize(header)
-            body_tokens = tokenize(body)
-            score = 0.0
+        # Строгий фильтр по кодексам/нормам (если явные подсказки).
+        if explicit_law_hints:
+            strict_matches = [
+                d for d in fused_docs
+                if canonical_law_codes_from_metadata(d.metadata or {}).intersection(explicit_law_hints)
+            ]
+            if len(strict_matches) >= max(3, min(10, top_k)):
+                fused_docs = strict_matches
 
-            if "статья" in header:
-                score += 0.9
-            if "пункт" in header:
-                score += 0.4
-            if "раздел" in header or "глава" in header or "§" in header:
-                score -= 0.35
-
-            if focus_tokens:
-                h = len(focus_tokens.intersection(header_tokens))
-                b = len(focus_tokens.intersection(body_tokens))
-                score += 1.0 * (h / max(1, len(focus_tokens)))
-                score += 0.5 * (b / max(1, len(focus_tokens)))
-            if entity_tokens:
-                eh = len(entity_tokens.intersection(header_tokens))
-                eb = len(entity_tokens.intersection(body_tokens))
-                score += 1.2 * (eh / max(1, len(entity_tokens)))
-                score += 0.6 * (eb / max(1, len(entity_tokens)))
-
-            if law_hints:
-                doc_codes = canonical_law_codes_from_metadata(md)
-                if doc_codes.intersection(law_hints):
-                    score += 0.8
-                else:
-                    penalty = 1.2 if explicit_law_hints else 0.2
-                    if org_profile_intent:
-                        penalty = min(penalty, 0.1)
-                    score -= penalty
-
-            if org_profile_intent:
-                if "федеральный конституционный закон" in source_type_norm:
-                    score += 1.1
-                elif "федеральный закон" in source_type_norm:
-                    score += 0.9
-                elif "конституция" in source_type_norm:
-                    score += 0.7
-                elif "кодекс" in source_type_norm:
-                    score -= 0.55
-
-            if entity_law_markers:
-                if any(marker in meta_blob for marker in entity_law_markers):
-                    score += 1.3
-                elif org_profile_intent and (
-                    "федеральный закон" in source_type_norm
-                    or "федеральный конституционный закон" in source_type_norm
-                ):
-                    score -= 0.25
-
-            rescored.append((score, -idx, doc))
-
-        rescored.sort(reverse=True)
-        fused = [doc for _, _, doc in rescored]
-
-        # Финальный фильтр по номеру статьи (если указан в вопросе).
+        # Если указан номер статьи — усиливаем точность.
         if article_hints:
-            preferred: List[Document] = []
-            rest: List[Document] = []
-            for d in fused:
-                header = normalize_text(f"{(d.metadata or {}).get('hierarchy_str', '')} {(d.metadata or {}).get('source_title', '')}")
+            article_matches = []
+            for d in fused_docs:
+                header = normalize_text(
+                    f"{(d.metadata or {}).get('hierarchy_str', '')} {(d.metadata or {}).get('source_title', '')}"
+                )
                 if any(article in header for article in article_hints):
-                    preferred.append(d)
-                else:
-                    rest.append(d)
-            fused = preferred + rest
+                    article_matches.append(d)
+            if len(article_matches) >= max(2, min(8, top_k)):
+                fused_docs = article_matches
 
-        if focus_tokens:
-            filtered: List[Document] = []
-            for d in fused:
-                searchable = (
-                    f"{(d.metadata or {}).get('source_title', '')} "
-                    f"{(d.metadata or {}).get('hierarchy_str', '')} "
-                    f"{d.page_content[:1600]}"
-                )
-                if focus_tokens.intersection(tokenize(searchable)):
-                    filtered.append(d)
-            if filtered:
-                fused = filtered
+        # Политика по учебникам.
+        textbook_docs = [d for d in fused_docs if is_textbook_metadata(d.metadata or {})]
+        if source_policy == "exclude_textbooks":
+            non_textbooks = [d for d in fused_docs if not is_textbook_metadata(d.metadata or {})]
+            fused_docs = non_textbooks
+        elif source_policy == "prefer_textbooks":
+            if len(textbook_docs) >= max(3, min(8, top_k)):
+                fused_docs = textbook_docs
 
-        if entity_tokens:
-            filtered: List[Document] = []
-            for d in fused:
-                searchable = (
-                    f"{(d.metadata or {}).get('source_title', '')} "
-                    f"{(d.metadata or {}).get('hierarchy_str', '')} "
-                    f"{d.page_content[:1800]}"
-                )
-                doc_tokens = tokenize(searchable)
-                if entity_tokens.intersection(doc_tokens):
-                    filtered.append(d)
-            if filtered:
-                fused = filtered
+        candidate_docs = fused_docs[: max(RERANK_CANDIDATES, top_k)]
+        if use_rerank:
+            reranked_docs, rerank_scores, rerank_model = self._rerank_candidates(question, candidate_docs)
+        else:
+            reranked_docs = candidate_docs
+            rerank_scores = {stable_doc_id(d): rrf_scores.get(stable_doc_id(d), 0.0) for d in candidate_docs}
+            rerank_model = "rrf_only"
 
-        question_norm = normalize_text(question)
-        if "инициативе работодателя" in question_norm:
-            rescored: List[Tuple[float, int, Document]] = []
-            for idx, doc in enumerate(fused):
-                md = doc.metadata or {}
-                text = normalize_text(
-                    f"{md.get('source_title', '')} {md.get('hierarchy_str', '')} {doc.page_content[:1400]}"
-                )
-                score = 0.0
-                if "инициативе работодателя" in text:
-                    score += 2.0
-                if "инициативе работника" in text:
-                    score -= 2.0
-                if "статья 81" in text:
-                    score += 1.0
-                rescored.append((score, -idx, doc))
-            rescored.sort(reverse=True)
-            fused = [doc for _, _, doc in rescored]
+        final_k = min(top_k, RERANK_TOP_K) if use_rerank else top_k
+        final_docs = reranked_docs[:final_k]
 
-        final_docs = fused[:top_k]
+        law_docs = sum(1 for d in fused_docs if is_law_metadata(d.metadata or {}))
+        practice_docs = sum(1 for d in fused_docs if is_practice_metadata(d.metadata or {}))
+        textbook_count = sum(1 for d in fused_docs if is_textbook_metadata(d.metadata or {}))
+
         debug = RetrievalDebug(
             query_variants=variants,
             law_hints=sorted(law_hints),
@@ -1230,11 +1374,36 @@ class OtusStyleRAG:
             inferred_law_hints=sorted(inferred_law_hints),
             entity_tokens=sorted(entity_tokens),
             article_hints=sorted(article_hints),
-            law_docs=len(law_ranked),
-            practice_docs=len(practice_ranked),
-            lexical_law_docs=len(lexical_law),
+            law_docs=law_docs,
+            practice_docs=practice_docs,
+            lexical_law_docs=len(bm25_doc_ids),
             final_docs=len(final_docs),
+            vector_docs=len(vector_doc_ids),
+            bm25_docs=len(bm25_doc_ids),
+            fused_docs=len(fused_docs),
+            rerank_model=rerank_model,
+            source_policy=source_policy,
+            textbook_docs=textbook_count,
         )
+
+        self.last_retrieval = {
+            "query_variants": variants,
+            "vector_hits": len(vector_doc_ids),
+            "bm25_hits": len(bm25_doc_ids),
+            "fused_hits": len(fused_docs),
+            "candidate_count": len(candidate_docs),
+            "rrf_scores": rrf_scores,
+            "rerank_scores": rerank_scores,
+            "reranker_model": rerank_model,
+            "use_hybrid": use_hybrid,
+            "use_rerank": use_rerank,
+            "final_docs": final_docs,
+            "candidate_docs": candidate_docs,
+            "final_k": final_k,
+            "source_policy": source_policy,
+            "textbook_docs": textbook_count,
+        }
+
         return final_docs, debug
 
     @staticmethod
@@ -1246,25 +1415,28 @@ class OtusStyleRAG:
             hierarchy = md.get("hierarchy_str", "")
             law_id = md.get("law_id", "")
             source_type = md.get("source_type", "")
-            header = f"[S{i}] {title}"
+            article = ""
+            match = ARTICLE_RE.search(str(hierarchy))
+            if match:
+                article = match.group(1)
             if law_id:
-                header += f" ({law_id})"
-            if source_type:
-                header += f" | {source_type}"
-            if hierarchy:
-                header += f" | {hierarchy}"
+                title = f"{title} ({law_id})"
+            header = (
+                f"[S{i}] [Источник: {title}; "
+                f"Статья: {article or 'не указана'}; "
+                f"Тип документа: {source_type or 'не указан'}; "
+                f"Иерархия: {hierarchy or 'не указана'}]"
+            )
             parts.append(f"{header}\n{doc.page_content}")
         return "\n\n".join(parts)
 
     def build_answer_prompt(self, question: str, docs: List[Document]) -> str:
         return f"""
-Работай только по переданному контексту.
-Если в вопросе есть тест с вариантами — выбери только один правильный вариант и обоснуй нормой.
-Всегда указывай ссылки на источники в формате [S1], [S2] и при возможности давай ссылку на consultant.ru.
-Не проси уточнить вопрос, если в контексте есть хотя бы один релевантный фрагмент.
+Отвечай строго по контексту.
+Если данных недостаточно — напиши "Информации недостаточно." и не додумывай.
 Для каждого правового тезиса ставь ссылку [S#] в конце предложения.
-Если источников несколько, используй минимум две ссылки [S#] в ответе.
-Если контекста недостаточно — явно укажи это.
+Если в вопросе есть тест с вариантами — выбери только один правильный вариант и обоснуй нормой.
+Не добавляй ссылки на источники, которых нет в контексте.
 
 Структура ответа:
 1) Краткий вывод.
@@ -1283,10 +1455,8 @@ class OtusStyleRAG:
     def answer(self, question: str, docs: List[Document]) -> str:
         if not docs:
             self.last_llm_query = ""
-            return (
-                "В базе не найдено достаточно релевантных фрагментов. "
-                "Уточните вопрос и, по возможности, укажите кодекс/статью."
-            )
+            self.last_llm_usage = {}
+            return "Информации недостаточно."
 
         prompt = self.build_answer_prompt(question, docs)
         self.last_llm_query = prompt
@@ -1295,11 +1465,95 @@ class OtusStyleRAG:
             HumanMessage(content=prompt),
         ]
         response = self.llm.invoke(messages)
+        self.last_llm_usage = self._extract_llm_usage(response)
         return str(response.content)
 
-    def ask(self, question: str, top_k: int = 8) -> Dict[str, Any]:
+    @staticmethod
+    def _extract_llm_usage(response: Any) -> Dict[str, Any]:
+        usage: Dict[str, Any] = {}
+        if response is None:
+            return usage
+        meta = getattr(response, "response_metadata", None)
+        if isinstance(meta, dict):
+            if isinstance(meta.get("token_usage"), dict):
+                usage = dict(meta["token_usage"])
+            elif isinstance(meta.get("usage"), dict):
+                usage = dict(meta["usage"])
+        usage_meta = getattr(response, "usage_metadata", None)
+        if isinstance(usage_meta, dict) and usage_meta:
+            usage = dict(usage_meta)
+        return usage
+
+    @staticmethod
+    def _sanitize_user_id(value: Optional[str]) -> str:
+        if not value:
+            return "local"
+        safe = re.sub(r"[^0-9A-Za-z_-]+", "_", str(value)).strip("_")
+        return safe or "local"
+
+    def _append_history_entry(self, payload: Dict[str, Any], user_id: Optional[str]) -> None:
+        try:
+            self.history_dir.mkdir(parents=True, exist_ok=True)
+            user_key = self._sanitize_user_id(user_id)
+            history_path = self.history_dir / f"{user_key}.jsonl"
+            with history_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to write history: %s", exc)
+
+    def _build_history_entry(
+        self,
+        question: str,
+        answer: str,
+        docs: List[Document],
+        user_id: Optional[str],
+    ) -> Dict[str, Any]:
+        retrieval = self.last_retrieval or {}
+        candidate_docs = retrieval.get("candidate_docs", docs) or []
+        rrf_scores = retrieval.get("rrf_scores", {}) or {}
+        rerank_scores = retrieval.get("rerank_scores", {}) or {}
+
+        found_documents = []
+        for rank, doc in enumerate(candidate_docs, start=1):
+            doc_id = stable_doc_id(doc)
+            found_documents.append(
+                {
+                    "rank": rank,
+                    "doc_id": doc_id,
+                    "rerank_score": rerank_scores.get(doc_id),
+                    "rrf_score": rrf_scores.get(doc_id),
+                    "metadata": doc.metadata or {},
+                    "text": doc.page_content,
+                }
+            )
+
+        pipeline_debug = {
+            "use_hybrid": retrieval.get("use_hybrid", True),
+            "use_rerank": retrieval.get("use_rerank", True),
+            "vector_hits": retrieval.get("vector_hits", 0),
+            "bm25_hits": retrieval.get("bm25_hits", 0),
+            "fused_hits": retrieval.get("fused_hits", 0),
+            "candidate_count": retrieval.get("candidate_count", 0),
+            "reranker_model": retrieval.get("reranker_model", ""),
+            "final_k": retrieval.get("final_k", len(docs)),
+        }
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_id": self._sanitize_user_id(user_id),
+            "question": question,
+            "query_variants": retrieval.get("query_variants", []),
+            "found_documents": found_documents,
+            "final_query_sent_to_llm": self.last_llm_query,
+            "answer": answer,
+            "llm_usage": self.last_llm_usage,
+            "pipeline_debug": pipeline_debug,
+        }
+
+    def ask(self, question: str, top_k: int = 8, user_id: Optional[str] = None) -> Dict[str, Any]:
         docs, debug = self.retrieve(question, top_k=top_k)
         answer = self.answer(question, docs)
+        self._append_history_entry(self._build_history_entry(question, answer, docs, user_id), user_id)
         sources = []
         for i, doc in enumerate(docs, start=1):
             md = doc.metadata or {}
@@ -1328,6 +1582,12 @@ class OtusStyleRAG:
                 "practice_docs": debug.practice_docs,
                 "lexical_law_docs": debug.lexical_law_docs,
                 "final_docs": debug.final_docs,
+                "vector_docs": debug.vector_docs,
+                "bm25_docs": debug.bm25_docs,
+                "fused_docs": debug.fused_docs,
+                "rerank_model": debug.rerank_model,
+                "source_policy": debug.source_policy,
+                "textbook_docs": debug.textbook_docs,
             },
         }
 
@@ -1347,6 +1607,68 @@ def print_result(result: Dict[str, Any]) -> None:
             print(f"  Тип: {src['source_type']}")
         if src["hierarchy"]:
             print(f"  {src['hierarchy']}")
+
+
+def _split_message(text: str, limit: int = 4000) -> List[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: List[str] = []
+    current = ""
+    for line in text.splitlines():
+        if len(current) + len(line) + 1 <= limit:
+            current += line + "\n"
+        else:
+            parts.append(current.strip())
+            current = line + "\n"
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+async def run_telegram_bot(rag: OtusStyleRAG) -> None:
+    if Bot is None or Dispatcher is None or types is None:
+        raise RuntimeError("aiogram не установлен. Установите: pip install aiogram")
+
+    load_dotenv("config.env")
+    load_dotenv(".env")
+    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_TOKEN не найден в config.env/.env")
+
+    bot = Bot(token=token)
+    dp = Dispatcher()
+
+    @dp.message(CommandStart())
+    async def start_cmd(message: types.Message) -> None:
+        await message.answer(
+            "Привет! Я юридический RAG-ассистент по праву РФ.\n"
+            "Задайте вопрос, я отвечу строго по базе документов."
+        )
+
+    @dp.message()
+    async def handle_question(message: types.Message) -> None:
+        user_question = (message.text or "").strip()
+        if not user_question:
+            await message.answer("Пожалуйста, задайте вопрос.")
+            return
+
+        await message.answer("Ищу в базе и формирую ответ...")
+        try:
+            user_id = str(message.from_user.id) if message.from_user else "unknown"
+            result = await asyncio.to_thread(rag.ask, user_question, user_id=user_id)
+            answer = str(result.get("answer", "")).strip()
+        except Exception as exc:
+            logger.exception("Ошибка при обработке вопроса: %s", exc)
+            await message.answer("Произошла ошибка при обработке запроса.")
+            return
+
+        for idx, part in enumerate(_split_message(answer), start=1):
+            if idx == 1:
+                await message.answer(part)
+            else:
+                await message.answer(f"(продолжение {idx})\n{part}")
+
+    await dp.start_polling(bot)
 
 
 def interactive_cli(rag: OtusStyleRAG) -> None:
@@ -1397,6 +1719,7 @@ def main() -> None:
     parser.add_argument("--query", default=None)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--llm-query-expansion", action="store_true")
+    parser.add_argument("--tg-bot", action="store_true")
     args = parser.parse_args()
 
     rag = OtusStyleRAG(
@@ -1407,7 +1730,9 @@ def main() -> None:
         prompt_path=Path(args.prompt_path),
     )
 
-    if args.query:
+    if args.tg_bot:
+        asyncio.run(run_telegram_bot(rag))
+    elif args.query:
         print_result(rag.ask(args.query, top_k=args.top_k))
     else:
         interactive_cli(rag)
