@@ -88,3 +88,4 @@ embeddings/
 logs/
 laws_rf_structured.jsonl
 output_fragments.jsonl
+backups/
