@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import sys
 from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from dotenv import load_dotenv
 
 from rag30 import OtusStyleRAG
@@ -29,6 +31,24 @@ def get_env(name: str, default: Optional[str] = None) -> str:
     if value is None or not str(value).strip():
         return ""
     return str(value).strip()
+
+
+def get_admin_ids() -> set[int]:
+    raw = get_env("TELEGRAM_ADMIN_IDS", "")
+    ids: set[int] = set()
+    for part in re.split(r"[,;\\s]+", raw):
+        if part and part.isdigit():
+            ids.add(int(part))
+    single = get_env("TELEGRAM_ADMIN_ID", "")
+    if single.isdigit():
+        ids.add(int(single))
+    if not ids:
+        ids.add(5166459333)
+    return ids
+
+
+def is_admin(message: types.Message, admin_ids: set[int]) -> bool:
+    return bool(message.from_user and message.from_user.id in admin_ids)
 
 
 def build_rag() -> OtusStyleRAG:
@@ -70,6 +90,7 @@ async def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN не найден в config.env/.env")
 
+    admin_ids = get_admin_ids()
     rag = build_rag()
     bot = Bot(token=token)
     dp = Dispatcher()
@@ -80,6 +101,15 @@ async def main() -> None:
             "Привет! Я юридический RAG-ассистент по праву РФ.\n"
             "Задайте вопрос, я отвечу строго по базе документов."
         )
+
+    @dp.message(Command("restart"))
+    async def restart_cmd(message: types.Message) -> None:
+        if not is_admin(message, admin_ids):
+            await message.answer("Недостаточно прав.")
+            return
+        await message.answer("Перезапуск...")
+        await asyncio.sleep(0.2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     @dp.message()
     async def handle_question(message: types.Message) -> None:

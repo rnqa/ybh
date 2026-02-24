@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import importlib.util
 import json
@@ -41,7 +42,7 @@ except Exception as exc:  # pragma: no cover
     ChatOpenAI = None  # type: ignore[assignment]
 
 try:
-    from sentence_transformers import SentenceTransformer(model, device="cuda")
+    from sentence_transformers import SentenceTransformer
 except Exception as exc:  # pragma: no cover
     IMPORT_ERRORS["sentence-transformers"] = exc
     SentenceTransformer = None  # type: ignore[assignment]
@@ -64,6 +65,29 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("rag30")
+
+DEFAULT_SYSTEM_PROMPT = (
+    "Ты юридический ассистент по праву РФ. "
+    "Отвечай строго на основе контекста. "
+    "Не придумывай нормы и не ссылайся на источники, которых нет в контексте."
+)
+
+DEFAULT_ANSWER_PROMPT = """
+Ты юридический ассистент по праву РФ.
+Отвечай строго на основе контекста.
+Не придумывай нормы и не ссылайся на источники, которых нет в контексте.
+
+Формат ответа:
+1. Краткий вывод.
+2. Правовое обоснование с цитированием источников [S1], [S2]...
+3. Если информации недостаточно — явно укажи ограничения.
+
+Контекст:
+{context}
+
+Вопрос:
+{question}
+"""
 
 
 # Конфигурация retrieval (по статье OTUS/Habr).
@@ -325,6 +349,14 @@ class OtusStyleRAG:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY не найден в config.env/.env")
 
+        self.system_prompt_path = Path(
+            os.getenv("RAG_SYSTEM_PROMPT_PATH", "prompts/legal_student_prompt_v2.txt")
+        )
+        self.answer_prompt_path = Path(
+            os.getenv("RAG_ANSWER_PROMPT_PATH", "prompts/legal_answer_prompt.txt")
+        )
+        self._load_prompts()
+
         self.embeddings = LaBSEEmbeddings(embedding_model)
         self.vector_store = FAISS.load_local(
             folder_path=str(index_dir),
@@ -361,6 +393,35 @@ class OtusStyleRAG:
             max_retries=2,
             api_key=api_key,
         )
+
+    @staticmethod
+    def _read_prompt_file(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return ""
+        except UnicodeDecodeError:
+            return path.read_text(encoding="utf-8-sig").strip()
+
+    def _load_prompts(self) -> None:
+        system_prompt = self._read_prompt_file(self.system_prompt_path)
+        answer_prompt = self._read_prompt_file(self.answer_prompt_path)
+
+        if not system_prompt:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
+        if not answer_prompt:
+            answer_prompt = DEFAULT_ANSWER_PROMPT
+
+        if "{context}" not in answer_prompt:
+            answer_prompt = answer_prompt.rstrip() + "\n\nКонтекст:\n{context}"
+        if "{question}" not in answer_prompt:
+            answer_prompt = answer_prompt.rstrip() + "\n\nВопрос:\n{question}"
+
+        self.system_prompt = system_prompt
+        self.answer_prompt_template = answer_prompt
+
+    def reload_prompts(self) -> None:
+        self._load_prompts()
 
     @staticmethod
     def _build_law_buckets(docs: Iterable[Document]) -> Dict[str, List[Document]]:
@@ -745,24 +806,10 @@ class OtusStyleRAG:
                 "Уточните вопрос и, по возможности, укажите кодекс/статью."
             )
 
-        prompt = f"""
-Ты юридический ассистент по праву РФ.
-Отвечай строго на основе контекста.
-Не придумывай нормы и не ссылайся на источники, которых нет в контексте.
-
-Формат ответа:
-1. Краткий вывод.
-2. Правовое обоснование с цитированием источников [S1], [S2]...
-3. Если информации недостаточно — явно укажи ограничения.
-
-Контекст:
-{self._build_context(docs)}
-
-Вопрос:
-{question}
-"""
+        context = self._build_context(docs)
+        prompt = self.answer_prompt_template.format(context=context, question=question)
         messages = [
-            SystemMessage(content="Ты точный юридический ассистент."),
+            SystemMessage(content=self.system_prompt),
             HumanMessage(content=prompt),
         ]
         response = self.llm.invoke(messages)
@@ -817,6 +864,122 @@ def print_result(result: Dict[str, Any]) -> None:
             print(f"  {src['hierarchy']}")
 
 
+def restart_self() -> None:
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def get_admin_ids_from_env() -> Set[int]:
+    raw = os.getenv("TELEGRAM_ADMIN_IDS", "")
+    ids: Set[int] = set()
+    for part in re.split(r"[,;\s]+", raw):
+        if part and part.isdigit():
+            ids.add(int(part))
+    single = os.getenv("TELEGRAM_ADMIN_ID", "")
+    if single.isdigit():
+        ids.add(int(single))
+    if not ids:
+        ids.add(5166459333)
+    return ids
+
+
+def split_message(text: str, limit: int = 4000) -> List[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: List[str] = []
+    current = ""
+    for line in text.splitlines():
+        if len(current) + len(line) + 1 <= limit:
+            current += (line + "\n")
+        else:
+            parts.append(current.strip())
+            current = line + "\n"
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+def run_telegram_bot(rag: OtusStyleRAG) -> None:
+    try:
+        from aiogram import Bot, Dispatcher, types
+        from aiogram.filters import CommandStart, Command
+        from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Не установлен aiogram. Установите: pip install aiogram"
+        ) from exc
+
+    load_dotenv("config.env")
+    load_dotenv(".env")
+    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_TOKEN не найден в config.env/.env")
+
+    admin_ids = get_admin_ids_from_env()
+    bot = Bot(token=token)
+    dp = Dispatcher()
+
+    def is_admin(message: types.Message) -> bool:
+        return bool(message.from_user and message.from_user.id in admin_ids)
+
+    admin_keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="/reload"), KeyboardButton(text="/restart")]],
+        resize_keyboard=True,
+        selective=True,
+    )
+
+    def admin_markup(message: types.Message) -> Dict[str, Any]:
+        return {"reply_markup": admin_keyboard} if is_admin(message) else {}
+
+    @dp.message(CommandStart())
+    async def start_cmd(message: types.Message) -> None:
+        await message.answer(
+            "Привет! Я юридический RAG-ассистент по праву РФ.\n"
+            "Задайте вопрос, и я отвечу строго по базе документов.",
+            **admin_markup(message),
+        )
+
+    @dp.message(Command("reload"))
+    async def reload_cmd(message: types.Message) -> None:
+        if not is_admin(message):
+            await message.answer("Недостаточно прав.")
+            return
+        rag.reload_prompts()
+        await message.answer("Промпты перезагружены.", **admin_markup(message))
+
+    @dp.message(Command("restart"))
+    async def restart_cmd(message: types.Message) -> None:
+        if not is_admin(message):
+            await message.answer("Недостаточно прав.")
+            return
+        await message.answer("Перезапуск...")
+        await asyncio.sleep(0.2)
+        restart_self()
+
+    @dp.message()
+    async def handle_question(message: types.Message) -> None:
+        user_question = (message.text or "").strip()
+        if not user_question:
+            await message.answer("Пожалуйста, задайте вопрос.")
+            return
+
+        await message.answer("Ищу в базе и формирую ответ...")
+        try:
+            result = await asyncio.to_thread(rag.ask, user_question)
+            answer = str(result.get("answer", "")).strip()
+        except Exception:
+            logger.exception("Ошибка при обработке запроса")
+            await message.answer("Произошла ошибка при обработке запроса.")
+            return
+
+        for idx, part in enumerate(split_message(answer), start=1):
+            if idx == 1:
+                await message.answer(part)
+            else:
+                await message.answer(f"(продолжение {idx})\n{part}")
+
+    asyncio.run(dp.start_polling(bot))
+
+
 def interactive_cli(rag: OtusStyleRAG) -> None:
     examples = [
         "Какие основания для увольнения работника по инициативе работодателя согласно ТК РФ?",
@@ -830,7 +993,9 @@ def interactive_cli(rag: OtusStyleRAG) -> None:
         print("1. Задать свой вопрос")
         print("2. Использовать пример")
         print("3. Выход")
-        choice = input("Выберите (1-3): ").strip()
+        print("4. Перезапустить")
+        print("5. Перезагрузить промпт")
+        choice = input("Выберите (1-5): ").strip()
 
         if choice == "1":
             q = input("Введите юридический вопрос: ").strip()
@@ -850,6 +1015,12 @@ def interactive_cli(rag: OtusStyleRAG) -> None:
                 print("Некорректный ввод")
         elif choice == "3":
             break
+        elif choice == "4":
+            print("Перезапуск...")
+            restart_self()
+        elif choice == "5":
+            rag.reload_prompts()
+            print("Промпты перезагружены.")
         else:
             print("Некорректный выбор")
 
@@ -863,6 +1034,7 @@ def main() -> None:
     parser.add_argument("--data-dir", default="NPA3001")
     parser.add_argument("--query", default=None)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--tg-bot", action="store_true", help="Запустить Telegram-бота")
     args = parser.parse_args()
 
     rag = OtusStyleRAG(
@@ -870,6 +1042,10 @@ def main() -> None:
         index_name=args.index_name,
         data_dir=Path(args.data_dir),
     )
+
+    if args.tg_bot:
+        run_telegram_bot(rag)
+        return
 
     if args.query:
         print_result(rag.ask(args.query, top_k=args.top_k))
