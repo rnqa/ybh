@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -47,6 +47,12 @@ except Exception as exc:  # pragma: no cover
     IMPORT_ERRORS["sentence-transformers"] = exc
     SentenceTransformer = None  # type: ignore[assignment]
 
+try:
+    from rank_bm25 import BM25Okapi
+except Exception as exc:  # pragma: no cover
+    IMPORT_ERRORS["rank-bm25"] = exc
+    BM25Okapi = None  # type: ignore[assignment]
+
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -77,10 +83,18 @@ DEFAULT_ANSWER_PROMPT = """
 Отвечай строго на основе контекста.
 Не придумывай нормы и не ссылайся на источники, которых нет в контексте.
 
+Правило цитирования:
+- Для каждого правового тезиса укажи источник в формате:
+  "Название источника, статья/пункт".
+- Не используй ссылки вида [S#].
+- В конце ответа добавь список использованных источников
+  с полным названием и статьёй/пунктом.
+
 Формат ответа:
-1. Краткий вывод.
-2. Правовое обоснование с цитированием источников [S1], [S2]...
-3. Если информации недостаточно — явно укажи ограничения.
+1) Краткий вывод.
+2) Правовое обоснование с указанием источников после каждого тезиса.
+3) Если информации недостаточно — явно укажи ограничения.
+4) Список использованных источников.
 
 Контекст:
 {context}
@@ -102,6 +116,16 @@ LAW_LAMBDA = 0.20
 PRACTICE_K = 8
 PRACTICE_FETCH_K = 40
 PRACTICE_LAMBDA = 0.80
+BM25_K = 50
+BM25_WEIGHT = 0.35
+
+SOURCE_MODES = {"npa_only", "textbook_only", "mixed"}
+DEFAULT_SOURCE_MODE = "mixed"
+DEFAULT_SOURCE_WEIGHTS = {
+    "npa": 0.7,
+    "textbook": 0.3,
+    "practice": 0.2,
+}
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{3,}")
 ARTICLE_RE = re.compile(r"(?:ст\.?|статья)\s*(\d+(?:\.\d+)?)", flags=re.IGNORECASE)
@@ -154,6 +178,16 @@ LAW_HINT_TITLE_PATTERNS: Dict[str, Tuple[str, ...]] = {
     "KOAP": (r"административн(ых|ого)?\s+правонаруш", r"\bкоап\b"),
 }
 
+ENTITY_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "свр": ("служба внешней разведки", "служба внешней разведки рф"),
+    "фсин": ("федеральная служба исполнения наказаний",),
+    "росгвард": ("войска национальной гвардии", "войска национальной гвардии рф"),
+    "мвд": ("министерство внутренних дел", "министерство внутренних дел рф"),
+    "ск": ("следственный комитет", "следственный комитет рф"),
+    "фсб": ("федеральная служба безопасности", "федеральная служба безопасности рф"),
+    "прокуратур": ("генеральная прокуратура", "прокуратура российской федерации"),
+}
+
 GENERIC_QUERY_TOKENS = {
     "вопрос", "основан", "согласн", "поряд", "договор", "прав", "обязан", "ответствен",
     "стат", "пункт", "российск", "федерац", "кодекс", "работник", "работодател",
@@ -182,6 +216,7 @@ def check_runtime_dependencies() -> None:
         "langchain-openai": "langchain_openai",
         "sentence-transformers": "sentence_transformers",
         "faiss-cpu": "faiss",
+        "rank-bm25": "rank_bm25",
     }
     missing = [pkg for pkg, mod in required_specs.items() if importlib.util.find_spec(mod) is None]
 
@@ -199,7 +234,7 @@ def check_runtime_dependencies() -> None:
     print(f"  \"{py}\" -m pip install --upgrade pip")
     print(
         f"  \"{py}\" -m pip install "
-        "langchain-core langchain-community langchain-openai sentence-transformers faiss-cpu"
+        "langchain-core langchain-community langchain-openai sentence-transformers faiss-cpu rank-bm25"
     )
     raise SystemExit(1)
 
@@ -276,6 +311,39 @@ def is_informative_text(text: str) -> bool:
     return len(letters) >= 20
 
 
+def is_textbook_metadata(metadata: Dict[str, Any]) -> bool:
+    data = normalize_text(
+        f"{metadata.get('source_type', '')} {metadata.get('source_title', '')} "
+        f"{metadata.get('law_id', '')}"
+    )
+    return "учеб" in data or data.endswith("_uch")
+
+
+def parse_source_mode(raw: Optional[str]) -> str:
+    value = (raw or "").strip().lower()
+    if value in SOURCE_MODES:
+        return value
+    return DEFAULT_SOURCE_MODE
+
+
+def parse_source_weights(raw: Optional[str]) -> Dict[str, float]:
+    weights = dict(DEFAULT_SOURCE_WEIGHTS)
+    if not raw:
+        return weights
+    for part in re.split(r"[,;\\s]+", raw.strip()):
+        if not part:
+            continue
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        try:
+            weights[key] = float(value.strip())
+        except ValueError:
+            continue
+    return weights
+
+
 def stable_doc_id(doc: Document) -> str:
     md = doc.metadata or {}
     for key in ("chunk_id", "id", "source_url"):
@@ -331,6 +399,11 @@ class RetrievalDebug:
     practice_docs: int
     lexical_law_docs: int
     final_docs: int
+    source_mode: str = DEFAULT_SOURCE_MODE
+    weights: Dict[str, float] = field(default_factory=dict)
+    npa_docs: int = 0
+    textbook_docs: int = 0
+    bm25_docs: int = 0
 
 
 class OtusStyleRAG:
@@ -339,6 +412,10 @@ class OtusStyleRAG:
         index_dir: Path = Path("faiss_indexes"),
         index_name: str = "law_db",
         data_dir: Path = Path("NPA3001"),
+        textbook_index_dir: Optional[Path] = None,
+        textbook_index_name: str = "textbook_db",
+        source_mode: Optional[str] = None,
+        source_weights: Optional[str] = None,
         embedding_model: str = "cointegrated/LaBSE-en-ru",
         llm_model: str = "gpt-4o-mini",
     ):
@@ -349,6 +426,17 @@ class OtusStyleRAG:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY не найден в config.env/.env")
 
+        self.source_mode = parse_source_mode(source_mode or os.getenv("RAG_SOURCE_MODE"))
+        self.source_weights = parse_source_weights(source_weights or os.getenv("RAG_SOURCE_WEIGHTS"))
+        logger.info("Source mode=%s weights=%s", self.source_mode, self.source_weights)
+
+        self.index_dir = Path(index_dir)
+        self.index_name = index_name
+        self.textbook_index_dir = Path(
+            textbook_index_dir or os.getenv("RAG_TEXTBOOK_INDEX_DIR", str(index_dir))
+        )
+        self.textbook_index_name = os.getenv("RAG_TEXTBOOK_INDEX_NAME", textbook_index_name)
+
         self.system_prompt_path = Path(
             os.getenv("RAG_SYSTEM_PROMPT_PATH", "prompts/legal_student_prompt_v2.txt")
         )
@@ -358,14 +446,15 @@ class OtusStyleRAG:
         self._load_prompts()
 
         self.embeddings = LaBSEEmbeddings(embedding_model)
-        self.vector_store = FAISS.load_local(
-            folder_path=str(index_dir),
+        self.vector_store_npa = FAISS.load_local(
+            folder_path=str(self.index_dir),
             embeddings=self.embeddings,
-            index_name=index_name,
+            index_name=self.index_name,
             allow_dangerous_deserialization=True,
         )
+        self.vector_store = self.vector_store_npa
 
-        index_dim = int(getattr(self.vector_store.index, "d"))
+        index_dim = int(getattr(self.vector_store_npa.index, "d"))
         emb_dim = int(self.embeddings.embedding_dimension())
         if index_dim != emb_dim:
             raise RuntimeError(
@@ -373,18 +462,58 @@ class OtusStyleRAG:
                 f"Нужно пересобрать индекс под {embedding_model}."
             )
 
-        patched = self._patch_docstore_from_jsonl(data_dir)
-        self.docs: List[Document] = list(self.vector_store.docstore._dict.values())
-        self.law_buckets = self._build_law_buckets(self.docs)
-        law_cnt = sum(1 for d in self.docs if is_law_metadata(d.metadata or {}))
-        practice_cnt = sum(1 for d in self.docs if is_practice_metadata(d.metadata or {}))
+        patched_npa = self._patch_docstore_from_jsonl(self.vector_store_npa, data_dir)
+        self.docs_all_npa: List[Document] = list(self.vector_store_npa.docstore._dict.values())
+        self.docs_npa: List[Document] = [
+            d for d in self.docs_all_npa if not is_textbook_metadata(d.metadata or {})
+        ]
+        self.docs: List[Document] = self.docs_npa
+        self.law_buckets_npa = self._build_law_buckets(self.docs_npa)
+        self.law_buckets = self.law_buckets_npa
+
+        law_cnt = sum(1 for d in self.docs_npa if is_law_metadata(d.metadata or {}))
+        practice_cnt = sum(1 for d in self.docs_npa if is_practice_metadata(d.metadata or {}))
         logger.info(
-            "FAISS loaded: docs=%s, patched=%s, law_docs=%s, practice_docs=%s",
-            len(self.docs),
-            patched,
+            "FAISS NPA loaded: docs=%s, patched=%s, law_docs=%s, practice_docs=%s",
+            len(self.docs_npa),
+            patched_npa,
             law_cnt,
             practice_cnt,
         )
+
+        self.vector_store_textbook = None
+        if self._index_exists(self.textbook_index_dir, self.textbook_index_name):
+            self.vector_store_textbook = FAISS.load_local(
+                folder_path=str(self.textbook_index_dir),
+                embeddings=self.embeddings,
+                index_name=self.textbook_index_name,
+                allow_dangerous_deserialization=True,
+            )
+            t_dim = int(getattr(self.vector_store_textbook.index, "d"))
+            if t_dim != emb_dim:
+                raise RuntimeError(
+                    f"Несовпадение размерности: FAISS(textbook)={t_dim}, embeddings={emb_dim}. "
+                    f"Нужно пересобрать индекс под {embedding_model}."
+                )
+            patched_textbook = self._patch_docstore_from_jsonl(self.vector_store_textbook, data_dir)
+            self.docs_textbook: List[Document] = list(self.vector_store_textbook.docstore._dict.values())
+            self.law_buckets_textbook = self._build_law_buckets(self.docs_textbook)
+            logger.info(
+                "FAISS textbook loaded: docs=%s, patched=%s",
+                len(self.docs_textbook),
+                patched_textbook,
+            )
+        else:
+            self.docs_textbook = [d for d in self.docs_all_npa if is_textbook_metadata(d.metadata or {})]
+            self.law_buckets_textbook = self._build_law_buckets(self.docs_textbook)
+            logger.warning(
+                "Textbook index not found (%s/%s). Using filtered docs from NPA index.",
+                self.textbook_index_dir,
+                self.textbook_index_name,
+            )
+
+        self.bm25_npa = self._build_bm25(self.docs_npa)
+        self.bm25_textbook = self._build_bm25(self.docs_textbook) if self.docs_textbook else None
 
         self.llm = ChatOpenAI(
             model=llm_model,
@@ -422,6 +551,30 @@ class OtusStyleRAG:
 
     def reload_prompts(self) -> None:
         self._load_prompts()
+
+    def set_source_mode(self, mode: str) -> None:
+        self.source_mode = parse_source_mode(mode)
+
+    def set_source_weights(self, weights: str) -> None:
+        self.source_weights = parse_source_weights(weights)
+
+    @staticmethod
+    def _index_exists(index_dir: Path, index_name: str) -> bool:
+        return (index_dir / f"{index_name}.faiss").exists()
+
+    @staticmethod
+    def _build_bm25(docs: List[Document]) -> Optional[Any]:
+        if BM25Okapi is None or not docs:
+            logger.warning("BM25 is disabled (rank_bm25 not installed or empty corpus).")
+            return None
+
+        tokenized: List[List[str]] = []
+        for doc in docs:
+            md = doc.metadata or {}
+            text = f"{md.get('source_title','')} {md.get('hierarchy_str','')} {doc.page_content}"
+            tokens = list(tokenize(text))
+            tokenized.append(tokens or [""])
+        return BM25Okapi(tokenized)
 
     @staticmethod
     def _build_law_buckets(docs: Iterable[Document]) -> Dict[str, List[Document]]:
@@ -477,13 +630,13 @@ class OtusStyleRAG:
         logger.info("Loaded clean chunk map: %s", len(chunk_map))
         return chunk_map
 
-    def _patch_docstore_from_jsonl(self, data_dir: Path) -> int:
+    def _patch_docstore_from_jsonl(self, vector_store: Any, data_dir: Path) -> int:
         clean = self._load_clean_chunk_map(data_dir)
         if not clean:
             return 0
 
         replaced = 0
-        for key, old_doc in self.vector_store.docstore._dict.items():
+        for key, old_doc in vector_store.docstore._dict.items():
             md = dict(old_doc.metadata or {})
             chunk_id = md.get("chunk_id")
             clean_doc = clean.get(chunk_id)
@@ -491,13 +644,21 @@ class OtusStyleRAG:
                 continue
             merged_md = dict(md)
             merged_md.update(clean_doc.metadata or {})
-            self.vector_store.docstore._dict[key] = Document(page_content=clean_doc.page_content, metadata=merged_md)
+            vector_store.docstore._dict[key] = Document(page_content=clean_doc.page_content, metadata=merged_md)
             replaced += 1
         return replaced
 
-    def _make_metadata_filter(self, channel: str, law_hints: Set[str]) -> Callable[[Dict[str, Any]], bool]:
+    def _make_metadata_filter(
+        self, channel: str, law_hints: Set[str], source_kind: str
+    ) -> Callable[[Dict[str, Any]], bool]:
         def _filter(metadata: Dict[str, Any]) -> bool:
             md = metadata or {}
+            if source_kind == "textbook":
+                if not is_textbook_metadata(md):
+                    return False
+            elif source_kind == "npa":
+                if is_textbook_metadata(md):
+                    return False
             if channel == "law":
                 if not is_law_metadata(md):
                     return False
@@ -589,21 +750,46 @@ class OtusStyleRAG:
             for v in filtered_variants:
                 if v not in merged:
                     merged.append(v)
+            for alias_variant in self._expand_alias_variants(question):
+                if alias_variant not in merged:
+                    merged.append(alias_variant)
             return merged[:max_variants]
         except Exception as exc:
             logger.warning("Multi-query generation failed: %s", exc)
-            return [question]
+            merged = [question]
+            merged.extend(self._expand_alias_variants(question))
+            return merged[:max_variants]
 
-    def _mmr_search(self, query: str, channel: str, law_hints: Set[str]) -> List[Document]:
+    @staticmethod
+    def _expand_alias_variants(question: str) -> List[str]:
+        text = normalize_text(question)
+        out: List[str] = []
+        for key, aliases in ENTITY_ALIASES.items():
+            if key in text:
+                for alias in aliases:
+                    out.append(f"{question} ({alias})")
+        return out
+
+    def _mmr_search(
+        self,
+        vector_store: Any,
+        query: str,
+        channel: str,
+        law_hints: Set[str],
+        source_kind: str,
+    ) -> List[Document]:
         if channel == "law":
             k, fetch_k, lambda_mult = LAW_K, LAW_FETCH_K, LAW_LAMBDA
         else:
             k, fetch_k, lambda_mult = PRACTICE_K, PRACTICE_FETCH_K, PRACTICE_LAMBDA
 
-        filter_fn = self._make_metadata_filter(channel=channel, law_hints=law_hints)
+        if vector_store is None:
+            return []
+
+        filter_fn = self._make_metadata_filter(channel=channel, law_hints=law_hints, source_kind=source_kind)
 
         try:
-            docs = self.vector_store.max_marginal_relevance_search(
+            docs = vector_store.max_marginal_relevance_search(
                 query=query,
                 k=k,
                 fetch_k=fetch_k,
@@ -623,6 +809,7 @@ class OtusStyleRAG:
 
     def _law_guided_lexical_search(
         self,
+        law_buckets: Dict[str, List[Document]],
         query_tokens: Set[str],
         focus_tokens: Set[str],
         law_hints: Set[str],
@@ -633,7 +820,7 @@ class OtusStyleRAG:
 
         scored: List[Tuple[float, Document]] = []
         for hint in law_hints:
-            docs = self.law_buckets.get(hint, [])
+            docs = law_buckets.get(hint, [])
             if not docs:
                 continue
 
@@ -679,62 +866,143 @@ class OtusStyleRAG:
         ranked_ids = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
         return [docs[i] for i in ranked_ids]
 
-    def _weighted_channel_fusion(self, law_docs: List[Document], practice_docs: List[Document]) -> List[Document]:
+    @staticmethod
+    def _rrf_merge_weighted(lists_of_docs: List[Tuple[List[Document], float]]) -> List[Document]:
+        scores: Dict[str, float] = {}
+        docs: Dict[str, Document] = {}
+
+        for docs_list, weight in lists_of_docs:
+            for rank, doc in enumerate(docs_list, start=1):
+                doc_id = stable_doc_id(doc)
+                scores[doc_id] = scores.get(doc_id, 0.0) + weight / (RRF_K + rank)
+                docs[doc_id] = doc
+
+        ranked_ids = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
+        return [docs[i] for i in ranked_ids]
+
+    def _weighted_channel_fusion(
+        self,
+        law_docs: List[Document],
+        practice_docs: List[Document],
+        law_weight: float = LAW_WEIGHT,
+        practice_weight: float = PRACTICE_WEIGHT,
+    ) -> List[Document]:
         scores: Dict[str, float] = {}
         doc_map: Dict[str, Document] = {}
 
         for rank, doc in enumerate(law_docs, start=1):
             doc_id = stable_doc_id(doc)
-            scores[doc_id] = scores.get(doc_id, 0.0) + LAW_WEIGHT / (RRF_K + rank)
+            scores[doc_id] = scores.get(doc_id, 0.0) + law_weight / (RRF_K + rank)
             doc_map[doc_id] = doc
 
         for rank, doc in enumerate(practice_docs, start=1):
             doc_id = stable_doc_id(doc)
-            scores[doc_id] = scores.get(doc_id, 0.0) + PRACTICE_WEIGHT / (RRF_K + rank)
+            scores[doc_id] = scores.get(doc_id, 0.0) + practice_weight / (RRF_K + rank)
             doc_map[doc_id] = doc
 
         ranked = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)
         return [doc_map[i] for i in ranked]
 
-    def retrieve(self, question: str, top_k: int = 8) -> Tuple[List[Document], RetrievalDebug]:
-        law_hints = extract_law_hints(question)
-        article_hints = extract_article_hints(question)
-        variants = self._generate_query_variants(question, max_variants=4)
-        query_tokens = tokenize(question)
-        focus_tokens = {t for t in query_tokens if len(t) >= 5 and t not in GENERIC_QUERY_TOKENS and t not in RU_STOPWORDS}
+    @staticmethod
+    def _bm25_search(
+        bm25: Any,
+        docs: List[Document],
+        query: str,
+        top_k: int,
+    ) -> List[Document]:
+        if bm25 is None or not docs:
+            return []
+        query_tokens = list(tokenize(query))
+        if not query_tokens:
+            return []
+        scores = bm25.get_scores(query_tokens)
+        if len(scores) == 0:
+            return []
+        ranked_ids = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        out: List[Document] = []
+        for idx in ranked_ids[:top_k]:
+            doc = docs[idx]
+            if not is_informative_text(doc.page_content):
+                continue
+            out.append(doc)
+        return out
 
-        law_runs: List[List[Document]] = []
-        practice_runs: List[List[Document]] = []
+    def _retrieve_for_source(
+        self,
+        source_kind: str,
+        question: str,
+        variants: List[str],
+        law_hints: Set[str],
+        article_hints: Set[str],
+        query_tokens: Set[str],
+        focus_tokens: Set[str],
+        top_k: int,
+    ) -> Tuple[List[Document], Dict[str, int]]:
+        if source_kind == "textbook":
+            vector_store = self.vector_store_textbook or self.vector_store_npa
+            docs_pool = self.docs_textbook
+            law_buckets = self.law_buckets_textbook
+            bm25 = self.bm25_textbook
+            use_practice = False
+        else:
+            vector_store = self.vector_store_npa
+            docs_pool = self.docs_npa
+            law_buckets = self.law_buckets_npa
+            bm25 = self.bm25_npa
+            use_practice = True
+
+        law_runs: List[Tuple[List[Document], float]] = []
+        practice_runs: List[Tuple[List[Document], float]] = []
+        bm25_docs_count = 0
+        lexical_law_count = 0
 
         for variant in variants:
-            law_runs.append(self._mmr_search(variant, channel="law", law_hints=law_hints))
-            practice_runs.append(self._mmr_search(variant, channel="practice", law_hints=law_hints))
+            law_docs = self._mmr_search(vector_store, variant, channel="law", law_hints=law_hints, source_kind=source_kind)
+            if law_docs:
+                law_runs.append((law_docs, 1.0))
+
+            if use_practice:
+                practice_docs = self._mmr_search(
+                    vector_store, variant, channel="practice", law_hints=law_hints, source_kind=source_kind
+                )
+                if practice_docs:
+                    practice_runs.append((practice_docs, 1.0))
+
+            bm25_docs = self._bm25_search(bm25, docs_pool, variant, top_k=max(BM25_K, top_k * 6))
+            if bm25_docs:
+                bm25_docs_count += len(bm25_docs)
+                law_runs.append((bm25_docs, BM25_WEIGHT))
 
         lexical_law = self._law_guided_lexical_search(
+            law_buckets=law_buckets,
             query_tokens=query_tokens,
             focus_tokens=focus_tokens,
             law_hints=law_hints,
             per_law=max(50, top_k * 10),
         )
         if lexical_law:
-            law_runs.append(lexical_law)
+            lexical_law_count = len(lexical_law)
+            law_runs.append((lexical_law, 0.85))
 
-        law_ranked = self._rrf_merge(law_runs, weight=1.0)
-        practice_ranked = self._rrf_merge(practice_runs, weight=1.0)
+        law_ranked = self._rrf_merge_weighted(law_runs)
+        practice_ranked = self._rrf_merge_weighted(practice_runs)
 
-        fused = self._weighted_channel_fusion(law_ranked, practice_ranked)
+        practice_weight = self.source_weights.get("practice", PRACTICE_WEIGHT)
+        fused = self._weighted_channel_fusion(law_ranked, practice_ranked, practice_weight=practice_weight)
 
-        # Финальный фильтр по номеру статьи (если указан в вопросе).
         if article_hints:
             preferred: List[Document] = []
             rest: List[Document] = []
             for d in fused:
-                header = normalize_text(f"{(d.metadata or {}).get('hierarchy_str', '')} {(d.metadata or {}).get('source_title', '')}")
+                header = normalize_text(
+                    f"{(d.metadata or {}).get('hierarchy_str', '')} {(d.metadata or {}).get('source_title', '')}"
+                )
                 if any(article in header for article in article_hints):
                     preferred.append(d)
                 else:
                     rest.append(d)
-            fused = preferred + rest
+            if preferred:
+                fused = preferred + rest
 
         if focus_tokens:
             filtered: List[Document] = []
@@ -769,14 +1037,80 @@ class OtusStyleRAG:
             fused = [doc for _, _, doc in rescored]
 
         final_docs = fused[:top_k]
+        stats = {
+            "law_docs": len(law_ranked),
+            "practice_docs": len(practice_ranked),
+            "lexical_law_docs": lexical_law_count,
+            "bm25_docs": bm25_docs_count,
+            "final_docs": len(final_docs),
+        }
+        return final_docs, stats
+
+    def retrieve(self, question: str, top_k: int = 8) -> Tuple[List[Document], RetrievalDebug]:
+        law_hints = extract_law_hints(question)
+        article_hints = extract_article_hints(question)
+        variants = self._generate_query_variants(question, max_variants=4)
+        query_tokens = tokenize(question)
+        focus_tokens = {t for t in query_tokens if len(t) >= 5 and t not in GENERIC_QUERY_TOKENS and t not in RU_STOPWORDS}
+
+        logger.info("Retrieval mode=%s weights=%s", self.source_mode, self.source_weights)
+
+        sources: List[Tuple[List[Document], float]] = []
+        total_stats = {"law_docs": 0, "practice_docs": 0, "lexical_law_docs": 0, "bm25_docs": 0}
+        npa_docs: List[Document] = []
+        textbook_docs: List[Document] = []
+
+        if self.source_mode in {"npa_only", "mixed"}:
+            npa_docs, npa_stats = self._retrieve_for_source(
+                source_kind="npa",
+                question=question,
+                variants=variants,
+                law_hints=law_hints,
+                article_hints=article_hints,
+                query_tokens=query_tokens,
+                focus_tokens=focus_tokens,
+                top_k=top_k,
+            )
+            sources.append((npa_docs, self.source_weights.get("npa", 1.0)))
+            for key in total_stats:
+                total_stats[key] += npa_stats.get(key, 0)
+
+        if self.source_mode in {"textbook_only", "mixed"}:
+            textbook_docs, textbook_stats = self._retrieve_for_source(
+                source_kind="textbook",
+                question=question,
+                variants=variants,
+                law_hints=law_hints,
+                article_hints=article_hints,
+                query_tokens=query_tokens,
+                focus_tokens=focus_tokens,
+                top_k=top_k,
+            )
+            sources.append((textbook_docs, self.source_weights.get("textbook", 1.0)))
+            for key in total_stats:
+                total_stats[key] += textbook_stats.get(key, 0)
+
+        if self.source_mode == "npa_only":
+            final_docs = npa_docs
+        elif self.source_mode == "textbook_only":
+            final_docs = textbook_docs
+        else:
+            final_docs = self._rrf_merge_weighted(sources)
+            final_docs = final_docs[:top_k]
+
         debug = RetrievalDebug(
             query_variants=variants,
             law_hints=sorted(law_hints),
             article_hints=sorted(article_hints),
-            law_docs=len(law_ranked),
-            practice_docs=len(practice_ranked),
-            lexical_law_docs=len(lexical_law),
+            law_docs=total_stats["law_docs"],
+            practice_docs=total_stats["practice_docs"],
+            lexical_law_docs=total_stats["lexical_law_docs"],
             final_docs=len(final_docs),
+            source_mode=self.source_mode,
+            weights=self.source_weights,
+            npa_docs=len(npa_docs),
+            textbook_docs=len(textbook_docs),
+            bm25_docs=total_stats["bm25_docs"],
         )
         return final_docs, debug
 
@@ -789,13 +1123,14 @@ class OtusStyleRAG:
             hierarchy = md.get("hierarchy_str", "")
             law_id = md.get("law_id", "")
             source_type = md.get("source_type", "")
-            header = f"[S{i}] {title}"
+            header = f"[Источник: {title}"
             if law_id:
-                header += f" ({law_id})"
+                header += f"; Кодекс/НПА: {law_id}"
             if source_type:
-                header += f" | {source_type}"
+                header += f"; Тип: {source_type}"
             if hierarchy:
-                header += f" | {hierarchy}"
+                header += f"; Статья/пункт: {hierarchy}"
+            header += "]"
             parts.append(f"{header}\n{doc.page_content}")
         return "\n\n".join(parts)
 
@@ -808,6 +1143,8 @@ class OtusStyleRAG:
 
         context = self._build_context(docs)
         prompt = self.answer_prompt_template.format(context=context, question=question)
+        logger.info("Answering with sources=%s mode=%s", len(docs), self.source_mode)
+        logger.debug("LLM prompt:\n%s", prompt)
         messages = [
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=prompt),
@@ -831,6 +1168,9 @@ class OtusStyleRAG:
                     "preview": (doc.page_content[:220] + "...") if len(doc.page_content) > 220 else doc.page_content,
                 }
             )
+        if sources:
+            source_titles = [f"{s.get('title','')} {s.get('hierarchy','')}".strip() for s in sources[:8]]
+            logger.info("Top sources: %s", source_titles)
         return {
             "question": question,
             "answer": answer,
@@ -843,6 +1183,11 @@ class OtusStyleRAG:
                 "practice_docs": debug.practice_docs,
                 "lexical_law_docs": debug.lexical_law_docs,
                 "final_docs": debug.final_docs,
+                "source_mode": debug.source_mode,
+                "weights": debug.weights,
+                "npa_docs": debug.npa_docs,
+                "textbook_docs": debug.textbook_docs,
+                "bm25_docs": debug.bm25_docs,
             },
         }
 
@@ -922,7 +1267,14 @@ def run_telegram_bot(rag: OtusStyleRAG) -> None:
         return bool(message.from_user and message.from_user.id in admin_ids)
 
     admin_keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="/reload"), KeyboardButton(text="/restart")]],
+        keyboard=[
+            [KeyboardButton(text="/reload"), KeyboardButton(text="/restart")],
+            [
+                KeyboardButton(text="/mode npa_only"),
+                KeyboardButton(text="/mode textbook_only"),
+                KeyboardButton(text="/mode mixed"),
+            ],
+        ],
         resize_keyboard=True,
         selective=True,
     )
@@ -945,6 +1297,40 @@ def run_telegram_bot(rag: OtusStyleRAG) -> None:
             return
         rag.reload_prompts()
         await message.answer("Промпты перезагружены.", **admin_markup(message))
+
+    @dp.message(Command("mode"))
+    async def mode_cmd(message: types.Message) -> None:
+        if not is_admin(message):
+            await message.answer("Недостаточно прав.")
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer(
+                f"Текущий режим: {rag.source_mode}\n"
+                f"Веса: {rag.source_weights}\n"
+                "Доступные режимы: npa_only, textbook_only, mixed",
+                **admin_markup(message),
+            )
+            return
+
+        raw_mode = parts[1].strip().lower()
+        if raw_mode in {"npa", "npa_only"}:
+            mode = "npa_only"
+        elif raw_mode in {"textbook", "textbook_only"}:
+            mode = "textbook_only"
+        elif raw_mode in {"mixed"}:
+            mode = "mixed"
+        else:
+            await message.answer("Некорректный режим. Используй: npa_only/textbook_only/mixed.")
+            return
+
+        rag.set_source_mode(mode)
+        await message.answer(
+            f"Режим обновлен: {rag.source_mode}\nВеса: {rag.source_weights}",
+            **admin_markup(message),
+        )
 
     @dp.message(Command("restart"))
     async def restart_cmd(message: types.Message) -> None:
@@ -995,7 +1381,8 @@ def interactive_cli(rag: OtusStyleRAG) -> None:
         print("3. Выход")
         print("4. Перезапустить")
         print("5. Перезагрузить промпт")
-        choice = input("Выберите (1-5): ").strip()
+        print("6. Режим источников")
+        choice = input("Выберите (1-6): ").strip()
 
         if choice == "1":
             q = input("Введите юридический вопрос: ").strip()
@@ -1021,6 +1408,17 @@ def interactive_cli(rag: OtusStyleRAG) -> None:
         elif choice == "5":
             rag.reload_prompts()
             print("Промпты перезагружены.")
+        elif choice == "6":
+            print(f"Текущий режим: {rag.source_mode}")
+            print(f"Текущие веса: {rag.source_weights}")
+            mode = input("Введите режим (npa_only/textbook_only/mixed): ").strip().lower()
+            if mode:
+                rag.set_source_mode(mode)
+                print(f"Режим обновлен: {rag.source_mode}")
+            weights = input("Введите веса (npa=...,textbook=...,practice=...) или Enter: ").strip()
+            if weights:
+                rag.set_source_weights(weights)
+                print(f"Веса обновлены: {rag.source_weights}")
         else:
             print("Некорректный выбор")
 
@@ -1031,9 +1429,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="RAG по архитектуре статьи OTUS (multi-query + weighted ensemble RRF)")
     parser.add_argument("--index-dir", default="faiss_indexes")
     parser.add_argument("--index-name", default="law_db")
+    parser.add_argument("--textbook-index-dir", default=os.getenv("RAG_TEXTBOOK_INDEX_DIR", "faiss_indexes"))
+    parser.add_argument("--textbook-index-name", default=os.getenv("RAG_TEXTBOOK_INDEX_NAME", "textbook_db"))
     parser.add_argument("--data-dir", default="NPA3001")
     parser.add_argument("--query", default=None)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--source-mode", default=None, choices=sorted(SOURCE_MODES))
+    parser.add_argument("--source-weights", default=None)
     parser.add_argument("--tg-bot", action="store_true", help="Запустить Telegram-бота")
     args = parser.parse_args()
 
@@ -1041,6 +1443,10 @@ def main() -> None:
         index_dir=Path(args.index_dir),
         index_name=args.index_name,
         data_dir=Path(args.data_dir),
+        textbook_index_dir=Path(args.textbook_index_dir),
+        textbook_index_name=args.textbook_index_name,
+        source_mode=args.source_mode,
+        source_weights=args.source_weights,
     )
 
     if args.tg_bot:

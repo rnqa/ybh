@@ -35,7 +35,12 @@ class STEmbeddings(Embeddings):
         return self.model.encode([text], convert_to_numpy=True, show_progress_bar=False)[0].tolist()
 
 
-def load_jsonl_folder(folder: Path, min_chars: int) -> List[Document]:
+def is_textbook_meta(md: Dict[str, Any]) -> bool:
+    data = f"{md.get('source_type', '')} {md.get('source_title', '')} {md.get('law_id', '')}".lower()
+    return "учеб" in data or data.endswith("_uch")
+
+
+def load_jsonl_folder(folder: Path, min_chars: int, source_mode: str) -> List[Document]:
     docs: List[Document] = []
     jsonl_files = list(folder.glob("*.jsonl"))
     LOGGER.info("JSONL files: %s", len(jsonl_files))
@@ -65,6 +70,12 @@ def load_jsonl_folder(folder: Path, min_chars: int) -> List[Document]:
                     "chunk_id": item.get("chunk_id", ""),
                     "source_url": item.get("source_url", ""),
                 }
+                is_textbook = is_textbook_meta(md)
+                if source_mode == "npa" and is_textbook:
+                    continue
+                if source_mode == "textbook" and not is_textbook:
+                    continue
+
                 docs.append(Document(page_content=text, metadata=md))
 
     LOGGER.info("Loaded documents: %s", len(docs))
@@ -78,16 +89,18 @@ def main() -> None:
     parser.add_argument("--index-name", default="law_db")
     parser.add_argument("--embedding-model", default="cointegrated/LaBSE-en-ru")
     parser.add_argument("--min-chars", type=int, default=40)
+    parser.add_argument("--source-mode", choices=["all", "npa", "textbook"], default="all")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
         raise SystemExit(f"Data dir not found: {data_dir}")
 
-    docs = load_jsonl_folder(data_dir, min_chars=args.min_chars)
+    docs = load_jsonl_folder(data_dir, min_chars=args.min_chars, source_mode=args.source_mode)
     if not docs:
         raise SystemExit("No documents found to index.")
 
+    LOGGER.info("Source mode: %s", args.source_mode)
     embeddings = STEmbeddings(args.embedding_model)
     index_dir = Path(args.index_dir)
     index_dir.mkdir(parents=True, exist_ok=True)
