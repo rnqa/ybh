@@ -1,8 +1,10 @@
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
 
-# Virtual environments
+# Virtual env
 .venv/
 venv/
 env/
@@ -11,36 +13,64 @@ env/
 .idea/
 .vscode/
 
-# Logs and temp
-*.log
-logs/
-rag_history.jsonl
-rag_history*.jsonl
-rag_history/
-*.tmp
-*.lock
-
-# Vector DBs / embeddings / indexes
-diagnostics/
+# Models and embeddings
 embeddings/
-faiss_indexes/
-semantic_laws_db/
-qdrant_laws/
+
+# Vector DBs
 chroma_db/
 db/
+qdrant_laws/
+semantic_laws_db/
+faiss_indexes/
 
-# Large binary formats
+# Logs
+*.log
+logs/
+
+# Temp
+*.tmp
+.lock
+
+# Env
+config.env
+.env
+
+embeddings/
+
+# Большие базы и индексы
+db/
+faiss_indexes/
+embeddings/
+semantic_laws_db/
+qdrant_laws/
+*.sqlite3
+*.pkl
+*.faiss
+*.bin
+
+# Большие базы и индексы
+db/
+faiss_indexes/
+embeddings/
+semantic_laws_db/
+qdrant_laws/
+
+# Форматы файлов
 *.sqlite
 *.sqlite3
 *.pkl
 *.faiss
 *.bin
 
-# Env files
-config.env
-.env
+db/
+embeddings/
+faiss_indexes/
+semantic_laws_db/
+qdrant_laws/
+.venv/
+__pycache__/
+*.pyc
 
-# Data folders
 laws/
 NPA3001/
 r2r/

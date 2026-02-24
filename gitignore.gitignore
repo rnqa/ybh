@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Models and embeddings
+embeddings/
+
+# Vector DBs
+chroma_db/
+db/
+qdrant_laws/
+semantic_laws_db/
+faiss_indexes/
+
+# Logs
+*.log
+logs/
+
+# Temp
+*.tmp
+.lock
+
+# Env
+config.env
+.env
