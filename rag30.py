@@ -10,7 +10,11 @@ import logging
 import os
 import re
 import sys
+import threading
+import time
+import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -103,6 +107,19 @@ DEFAULT_ANSWER_PROMPT = """
 {question}
 """
 
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
+ALLOWED_LLM_MODELS = {
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o-mini",
+}
+
 
 # Конфигурация retrieval (по статье OTUS/Habr).
 LAW_WEIGHT = 0.50
@@ -126,6 +143,10 @@ DEFAULT_SOURCE_WEIGHTS = {
     "textbook": 0.3,
     "practice": 0.2,
 }
+
+DEFAULT_TELEMETRY_DIR = "rag_history"
+DEFAULT_TELEMETRY_FILE = "rag_history.jsonl"
+DEFAULT_USAGE_DB = "rag_usage.sqlite"
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{3,}")
 ARTICLE_RE = re.compile(r"(?:ст\.?|статья)\s*(\d+(?:\.\d+)?)", flags=re.IGNORECASE)
@@ -344,6 +365,207 @@ def parse_source_weights(raw: Optional[str]) -> Dict[str, float]:
     return weights
 
 
+def validate_llm_model(raw: Optional[str]) -> str:
+    model = (raw or DEFAULT_LLM_MODEL).strip()
+    if model not in ALLOWED_LLM_MODELS:
+        allowed = ", ".join(sorted(ALLOWED_LLM_MODELS))
+        raise ValueError(f"Недопустимая модель: {model}. Разрешены: {allowed}")
+    return model
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def serialize_doc(doc: Document, rank: int) -> Dict[str, Any]:
+    md = doc.metadata or {}
+    return {
+        "rank": rank,
+        "id": md.get("id", ""),
+        "chunk_id": md.get("chunk_id", ""),
+        "title": md.get("source_title", ""),
+        "law_id": md.get("law_id", ""),
+        "source_type": md.get("source_type", ""),
+        "hierarchy": md.get("hierarchy_str", ""),
+        "source_url": md.get("source_url", ""),
+        "content": doc.page_content,
+    }
+
+
+class UsageTracker:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS usage_daily ("
+            "user_id TEXT, day TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, "
+            "PRIMARY KEY (user_id, day)"
+            ")"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS usage_weekly ("
+            "user_id TEXT, week TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, "
+            "PRIMARY KEY (user_id, week)"
+            ")"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS usage_monthly ("
+            "user_id TEXT, month TEXT, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, "
+            "PRIMARY KEY (user_id, month)"
+            ")"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS usage_total ("
+            "user_id TEXT PRIMARY KEY, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER"
+            ")"
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def _upsert(self, table: str, key_col: str, key_val: str, user_id: str, prompt: int, completion: int) -> None:
+        total = prompt + completion
+        self._conn.execute(
+            f"INSERT INTO {table} (user_id, {key_col}, prompt_tokens, completion_tokens, total_tokens) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, {key_col}) DO UPDATE SET "
+            "prompt_tokens = prompt_tokens + excluded.prompt_tokens, "
+            "completion_tokens = completion_tokens + excluded.completion_tokens, "
+            "total_tokens = total_tokens + excluded.total_tokens".format(key_col=key_col),
+            (user_id, key_val, prompt, completion, total),
+        )
+
+    def _upsert_total(self, user_id: str, prompt: int, completion: int) -> None:
+        total = prompt + completion
+        self._conn.execute(
+            "INSERT INTO usage_total (user_id, prompt_tokens, completion_tokens, total_tokens) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "prompt_tokens = prompt_tokens + excluded.prompt_tokens, "
+            "completion_tokens = completion_tokens + excluded.completion_tokens, "
+            "total_tokens = total_tokens + excluded.total_tokens",
+            (user_id, prompt, completion, total),
+        )
+
+    def record(self, user_id: str, prompt_tokens: int, completion_tokens: int) -> None:
+        if prompt_tokens < 0 or completion_tokens < 0:
+            return
+        total = prompt_tokens + completion_tokens
+        if total <= 0:
+            return
+        today = datetime.now(timezone.utc).date()
+        day = today.isoformat()
+        week = f"{today.isocalendar().year}-W{today.isocalendar().week:02d}"
+        month = f"{today.year:04d}-{today.month:02d}"
+        with self._lock:
+            self._upsert("usage_daily", "day", day, user_id, prompt_tokens, completion_tokens)
+            self._upsert("usage_weekly", "week", week, user_id, prompt_tokens, completion_tokens)
+            self._upsert("usage_monthly", "month", month, user_id, prompt_tokens, completion_tokens)
+            self._upsert_total(user_id, prompt_tokens, completion_tokens)
+            self._upsert_total("__all__", prompt_tokens, completion_tokens)
+            self._conn.commit()
+
+    def _fetch_row(self, table: str, key_col: str, key_val: str, user_id: str) -> Dict[str, int]:
+        cur = self._conn.cursor()
+        cur.execute(
+            f"SELECT prompt_tokens, completion_tokens, total_tokens FROM {table} "
+            f"WHERE user_id = ? AND {key_col} = ?",
+            (user_id, key_val),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {"prompt_tokens": int(row[0]), "completion_tokens": int(row[1]), "total_tokens": int(row[2])}
+
+    def _fetch_total(self, user_id: str) -> Dict[str, int]:
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT prompt_tokens, completion_tokens, total_tokens FROM usage_total WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {"prompt_tokens": int(row[0]), "completion_tokens": int(row[1]), "total_tokens": int(row[2])}
+
+    def get_snapshot(self, user_id: str) -> Dict[str, Dict[str, int]]:
+        today = datetime.now(timezone.utc).date()
+        day = today.isoformat()
+        week = f"{today.isocalendar().year}-W{today.isocalendar().week:02d}"
+        month = f"{today.year:04d}-{today.month:02d}"
+        with self._lock:
+            return {
+                "day": self._fetch_row("usage_daily", "day", day, user_id),
+                "week": self._fetch_row("usage_weekly", "week", week, user_id),
+                "month": self._fetch_row("usage_monthly", "month", month, user_id),
+                "total": self._fetch_total(user_id),
+            }
+
+
+class TelemetryLogger:
+    def __init__(self, history_dir: Path, history_file: Path, usage_db: Path, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.history_dir = history_dir
+        self.history_file = history_file
+        self.history_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._usage = UsageTracker(usage_db) if enabled else None
+
+    def close(self) -> None:
+        if self._usage:
+            self._usage.close()
+
+    def get_usage_snapshot(self, user_id: str) -> Dict[str, Dict[str, int]]:
+        if not self._usage:
+            return {"day": {}, "week": {}, "month": {}, "total": {}}
+        return self._usage.get_snapshot(user_id)
+
+    def log_interaction(
+        self,
+        user_id: str,
+        question: str,
+        all_docs: List[Document],
+        final_docs: List[Document],
+        system_prompt: str,
+        user_prompt: str,
+        answer: str,
+        model: str,
+        usage: Dict[str, int],
+        debug: Dict[str, Any],
+    ) -> None:
+        if not self.enabled:
+            return
+        payload = {
+            "timestamp": now_iso(),
+            "user_id": user_id,
+            "question": question,
+            "all_documents": [serialize_doc(d, i) for i, d in enumerate(all_docs, start=1)],
+            "final_documents": [serialize_doc(d, i) for i, d in enumerate(final_docs, start=1)],
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "answer": answer,
+            "model": model,
+            "usage": usage,
+            "debug": debug,
+        }
+        line = json.dumps(payload, ensure_ascii=False)
+        per_user_path = self.history_dir / f"{user_id}.jsonl"
+        with self._lock:
+            with per_user_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            with self.history_file.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        if self._usage and usage:
+            self._usage.record(
+                user_id,
+                int(usage.get("prompt_tokens", 0)),
+                int(usage.get("completion_tokens", 0)),
+            )
+
+
 def stable_doc_id(doc: Document) -> str:
     md = doc.metadata or {}
     for key in ("chunk_id", "id", "source_url"):
@@ -417,7 +639,7 @@ class OtusStyleRAG:
         source_mode: Optional[str] = None,
         source_weights: Optional[str] = None,
         embedding_model: str = "cointegrated/LaBSE-en-ru",
-        llm_model: str = "gpt-4o-mini",
+        llm_model: Optional[str] = None,
     ):
         load_dotenv("config.env")
         load_dotenv(".env")
@@ -425,6 +647,7 @@ class OtusStyleRAG:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY не найден в config.env/.env")
+        self.api_key = api_key
 
         self.source_mode = parse_source_mode(source_mode or os.getenv("RAG_SOURCE_MODE"))
         self.source_weights = parse_source_weights(source_weights or os.getenv("RAG_SOURCE_WEIGHTS"))
@@ -515,12 +738,25 @@ class OtusStyleRAG:
         self.bm25_npa = self._build_bm25(self.docs_npa)
         self.bm25_textbook = self._build_bm25(self.docs_textbook) if self.docs_textbook else None
 
-        self.llm = ChatOpenAI(
-            model=llm_model,
+        self.llm_model = validate_llm_model(llm_model or os.getenv("RAG_LLM_MODEL"))
+        self.llm = self._build_llm(self.llm_model)
+        logger.info("LLM model=%s", self.llm_model)
+
+        telemetry_enabled = os.getenv("RAG_TELEMETRY", "1").strip() not in {"0", "false", "no"}
+        history_dir = Path(os.getenv("RAG_HISTORY_DIR", DEFAULT_TELEMETRY_DIR))
+        history_file = Path(os.getenv("RAG_HISTORY_FILE", DEFAULT_TELEMETRY_FILE))
+        usage_db = Path(os.getenv("RAG_USAGE_DB", DEFAULT_USAGE_DB))
+        self.telemetry = TelemetryLogger(history_dir, history_file, usage_db, enabled=telemetry_enabled)
+
+    def _build_llm(self, model: str) -> Any:
+        if ChatOpenAI is None:  # pragma: no cover
+            raise RuntimeError("langchain-openai не установлен.")
+        return ChatOpenAI(
+            model=model,
             temperature=0.1,
             timeout=90,
             max_retries=2,
-            api_key=api_key,
+            api_key=self.api_key,
         )
 
     @staticmethod
@@ -549,6 +785,63 @@ class OtusStyleRAG:
         self.system_prompt = system_prompt
         self.answer_prompt_template = answer_prompt
 
+    def _extract_usage(self, response: Any, prompt_text: str, answer_text: str) -> Dict[str, int]:
+        usage: Dict[str, int] = {}
+        for attr in ("usage_metadata", "response_metadata"):
+            meta = getattr(response, attr, None)
+            if isinstance(meta, dict):
+                if "token_usage" in meta and isinstance(meta["token_usage"], dict):
+                    tu = meta["token_usage"]
+                    usage = {
+                        "prompt_tokens": int(tu.get("prompt_tokens", 0)),
+                        "completion_tokens": int(tu.get("completion_tokens", 0)),
+                        "total_tokens": int(tu.get("total_tokens", 0)),
+                    }
+                    break
+                if {"input_tokens", "output_tokens", "total_tokens"} <= set(meta.keys()):
+                    usage = {
+                        "prompt_tokens": int(meta.get("input_tokens", 0)),
+                        "completion_tokens": int(meta.get("output_tokens", 0)),
+                        "total_tokens": int(meta.get("total_tokens", 0)),
+                    }
+                    break
+                if {"prompt_tokens", "completion_tokens", "total_tokens"} <= set(meta.keys()):
+                    usage = {
+                        "prompt_tokens": int(meta.get("prompt_tokens", 0)),
+                        "completion_tokens": int(meta.get("completion_tokens", 0)),
+                        "total_tokens": int(meta.get("total_tokens", 0)),
+                    }
+                    break
+
+        if usage:
+            return usage
+
+        try:
+            import tiktoken  # type: ignore
+
+            model_name = (
+                getattr(self.llm, "model_name", None)
+                or getattr(self.llm, "model", None)
+                or self.llm_model
+                or DEFAULT_LLM_MODEL
+            )
+            enc = tiktoken.encoding_for_model(model_name)
+            prompt_tokens = len(enc.encode(prompt_text))
+            completion_tokens = len(enc.encode(answer_text))
+            return {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        except Exception:
+            prompt_tokens = max(1, len(prompt_text) // 4)
+            completion_tokens = max(1, len(answer_text) // 4)
+            return {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+
     def reload_prompts(self) -> None:
         self._load_prompts()
 
@@ -557,6 +850,11 @@ class OtusStyleRAG:
 
     def set_source_weights(self, weights: str) -> None:
         self.source_weights = parse_source_weights(weights)
+
+    def set_llm_model(self, model: str) -> None:
+        self.llm_model = validate_llm_model(model)
+        self.llm = self._build_llm(self.llm_model)
+        logger.info("LLM model updated: %s", self.llm_model)
 
     @staticmethod
     def _index_exists(index_dir: Path, index_name: str) -> bool:
@@ -937,7 +1235,7 @@ class OtusStyleRAG:
         query_tokens: Set[str],
         focus_tokens: Set[str],
         top_k: int,
-    ) -> Tuple[List[Document], Dict[str, int]]:
+    ) -> Tuple[List[Document], List[Document], Dict[str, int]]:
         if source_kind == "textbook":
             vector_store = self.vector_store_textbook or self.vector_store_npa
             docs_pool = self.docs_textbook
@@ -1036,6 +1334,7 @@ class OtusStyleRAG:
             rescored.sort(reverse=True)
             fused = [doc for _, _, doc in rescored]
 
+        all_docs = fused
         final_docs = fused[:top_k]
         stats = {
             "law_docs": len(law_ranked),
@@ -1044,9 +1343,11 @@ class OtusStyleRAG:
             "bm25_docs": bm25_docs_count,
             "final_docs": len(final_docs),
         }
-        return final_docs, stats
+        return final_docs, all_docs, stats
 
-    def retrieve(self, question: str, top_k: int = 8) -> Tuple[List[Document], RetrievalDebug]:
+    def retrieve_with_trace(
+        self, question: str, top_k: int = 8
+    ) -> Tuple[List[Document], List[Document], RetrievalDebug]:
         law_hints = extract_law_hints(question)
         article_hints = extract_article_hints(question)
         variants = self._generate_query_variants(question, max_variants=4)
@@ -1058,10 +1359,12 @@ class OtusStyleRAG:
         sources: List[Tuple[List[Document], float]] = []
         total_stats = {"law_docs": 0, "practice_docs": 0, "lexical_law_docs": 0, "bm25_docs": 0}
         npa_docs: List[Document] = []
+        npa_all_docs: List[Document] = []
         textbook_docs: List[Document] = []
+        textbook_all_docs: List[Document] = []
 
         if self.source_mode in {"npa_only", "mixed"}:
-            npa_docs, npa_stats = self._retrieve_for_source(
+            npa_docs, npa_all_docs, npa_stats = self._retrieve_for_source(
                 source_kind="npa",
                 question=question,
                 variants=variants,
@@ -1071,12 +1374,12 @@ class OtusStyleRAG:
                 focus_tokens=focus_tokens,
                 top_k=top_k,
             )
-            sources.append((npa_docs, self.source_weights.get("npa", 1.0)))
+            sources.append((npa_all_docs, self.source_weights.get("npa", 1.0)))
             for key in total_stats:
                 total_stats[key] += npa_stats.get(key, 0)
 
         if self.source_mode in {"textbook_only", "mixed"}:
-            textbook_docs, textbook_stats = self._retrieve_for_source(
+            textbook_docs, textbook_all_docs, textbook_stats = self._retrieve_for_source(
                 source_kind="textbook",
                 question=question,
                 variants=variants,
@@ -1086,17 +1389,19 @@ class OtusStyleRAG:
                 focus_tokens=focus_tokens,
                 top_k=top_k,
             )
-            sources.append((textbook_docs, self.source_weights.get("textbook", 1.0)))
+            sources.append((textbook_all_docs, self.source_weights.get("textbook", 1.0)))
             for key in total_stats:
                 total_stats[key] += textbook_stats.get(key, 0)
 
         if self.source_mode == "npa_only":
             final_docs = npa_docs
+            all_docs = npa_all_docs
         elif self.source_mode == "textbook_only":
             final_docs = textbook_docs
+            all_docs = textbook_all_docs
         else:
-            final_docs = self._rrf_merge_weighted(sources)
-            final_docs = final_docs[:top_k]
+            all_docs = self._rrf_merge_weighted(sources)
+            final_docs = all_docs[:top_k]
 
         debug = RetrievalDebug(
             query_variants=variants,
@@ -1112,6 +1417,10 @@ class OtusStyleRAG:
             textbook_docs=len(textbook_docs),
             bm25_docs=total_stats["bm25_docs"],
         )
+        return final_docs, all_docs, debug
+
+    def retrieve(self, question: str, top_k: int = 8) -> Tuple[List[Document], RetrievalDebug]:
+        final_docs, _all_docs, debug = self.retrieve_with_trace(question, top_k=top_k)
         return final_docs, debug
 
     @staticmethod
@@ -1134,12 +1443,12 @@ class OtusStyleRAG:
             parts.append(f"{header}\n{doc.page_content}")
         return "\n\n".join(parts)
 
-    def answer(self, question: str, docs: List[Document]) -> str:
+    def answer(self, question: str, docs: List[Document]) -> Tuple[str, str, Dict[str, int]]:
         if not docs:
             return (
                 "В базе не найдено достаточно релевантных фрагментов. "
                 "Уточните вопрос и, по возможности, укажите кодекс/статью."
-            )
+            ), "", {}
 
         context = self._build_context(docs)
         prompt = self.answer_prompt_template.format(context=context, question=question)
@@ -1150,11 +1459,14 @@ class OtusStyleRAG:
             HumanMessage(content=prompt),
         ]
         response = self.llm.invoke(messages)
-        return str(response.content)
+        answer_text = str(response.content)
+        usage = self._extract_usage(response, prompt_text=prompt, answer_text=answer_text)
+        return answer_text, prompt, usage
 
-    def ask(self, question: str, top_k: int = 8) -> Dict[str, Any]:
-        docs, debug = self.retrieve(question, top_k=top_k)
-        answer = self.answer(question, docs)
+    def ask(self, question: str, top_k: int = 8, user_id: Optional[str] = None) -> Dict[str, Any]:
+        uid = str(user_id or "cli")
+        docs, all_docs, debug = self.retrieve_with_trace(question, top_k=top_k)
+        answer, prompt, usage = self.answer(question, docs)
         sources = []
         for i, doc in enumerate(docs, start=1):
             md = doc.metadata or {}
@@ -1171,6 +1483,31 @@ class OtusStyleRAG:
         if sources:
             source_titles = [f"{s.get('title','')} {s.get('hierarchy','')}".strip() for s in sources[:8]]
             logger.info("Top sources: %s", source_titles)
+        self.telemetry.log_interaction(
+            user_id=uid,
+            question=question,
+            all_docs=all_docs,
+            final_docs=docs,
+            system_prompt=self.system_prompt,
+            user_prompt=prompt,
+            answer=answer,
+            model=self.llm_model,
+            usage=usage,
+            debug={
+                "query_variants": debug.query_variants,
+                "law_hints": debug.law_hints,
+                "article_hints": debug.article_hints,
+                "law_docs": debug.law_docs,
+                "practice_docs": debug.practice_docs,
+                "lexical_law_docs": debug.lexical_law_docs,
+                "final_docs": debug.final_docs,
+                "source_mode": debug.source_mode,
+                "weights": debug.weights,
+                "npa_docs": debug.npa_docs,
+                "textbook_docs": debug.textbook_docs,
+                "bm25_docs": debug.bm25_docs,
+            },
+        )
         return {
             "question": question,
             "answer": answer,
@@ -1274,6 +1611,7 @@ def run_telegram_bot(rag: OtusStyleRAG) -> None:
                 KeyboardButton(text="/mode textbook_only"),
                 KeyboardButton(text="/mode mixed"),
             ],
+            [KeyboardButton(text="/usage"), KeyboardButton(text="/weights"), KeyboardButton(text="/model")],
         ],
         resize_keyboard=True,
         selective=True,
@@ -1332,6 +1670,89 @@ def run_telegram_bot(rag: OtusStyleRAG) -> None:
             **admin_markup(message),
         )
 
+    @dp.message(Command("usage"))
+    async def usage_cmd(message: types.Message) -> None:
+        if not is_admin(message):
+            await message.answer("Недостаточно прав.")
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split()
+        target_user = None
+        if len(parts) >= 2 and parts[1].isdigit():
+            target_user = parts[1]
+        elif len(parts) >= 2 and parts[1].lower() == "all":
+            target_user = "__all__"
+        else:
+            target_user = str(message.from_user.id) if message.from_user else "unknown"
+
+        snap = rag.telemetry.get_usage_snapshot(target_user)
+        def fmt(label: str, data: Dict[str, int]) -> str:
+            return (
+                f"{label}: "
+                f"prompt={data.get('prompt_tokens',0)}, "
+                f"completion={data.get('completion_tokens',0)}, "
+                f"total={data.get('total_tokens',0)}"
+            )
+
+        reply = (
+            f"Usage for {target_user}:\n"
+            f"{fmt('day', snap.get('day', {}))}\n"
+            f"{fmt('week', snap.get('week', {}))}\n"
+            f"{fmt('month', snap.get('month', {}))}\n"
+            f"{fmt('total', snap.get('total', {}))}"
+        )
+        await message.answer(reply, **admin_markup(message))
+
+    @dp.message(Command("weights"))
+    async def weights_cmd(message: types.Message) -> None:
+        if not is_admin(message):
+            await message.answer("Недостаточно прав.")
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer(
+                f"Текущие веса: {rag.source_weights}\n"
+                "Пример: /weights npa=0.7,textbook=0.3,practice=0.2",
+                **admin_markup(message),
+            )
+            return
+
+        rag.set_source_weights(parts[1].strip())
+        await message.answer(
+            f"Веса обновлены: {rag.source_weights}",
+            **admin_markup(message),
+        )
+
+    @dp.message(Command("model"))
+    async def model_cmd(message: types.Message) -> None:
+        if not is_admin(message):
+            await message.answer("Недостаточно прав.")
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        allowed = ", ".join(sorted(ALLOWED_LLM_MODELS))
+        if len(parts) < 2:
+            await message.answer(
+                f"Текущая модель: {rag.llm_model}\n"
+                f"Доступные модели: {allowed}\n"
+                "Пример: /model gpt-4.1-mini",
+                **admin_markup(message),
+            )
+            return
+
+        raw_model = parts[1].strip()
+        try:
+            rag.set_llm_model(raw_model)
+        except ValueError as exc:
+            await message.answer(f"{exc}\nДоступные модели: {allowed}", **admin_markup(message))
+            return
+
+        await message.answer(f"Модель обновлена: {rag.llm_model}", **admin_markup(message))
+
     @dp.message(Command("restart"))
     async def restart_cmd(message: types.Message) -> None:
         if not is_admin(message):
@@ -1350,7 +1771,8 @@ def run_telegram_bot(rag: OtusStyleRAG) -> None:
 
         await message.answer("Ищу в базе и формирую ответ...")
         try:
-            result = await asyncio.to_thread(rag.ask, user_question)
+            user_id = str(message.from_user.id) if message.from_user else "unknown"
+            result = await asyncio.to_thread(rag.ask, user_question, user_id=user_id)
             answer = str(result.get("answer", "")).strip()
         except Exception:
             logger.exception("Ошибка при обработке запроса")
@@ -1382,12 +1804,13 @@ def interactive_cli(rag: OtusStyleRAG) -> None:
         print("4. Перезапустить")
         print("5. Перезагрузить промпт")
         print("6. Режим источников")
-        choice = input("Выберите (1-6): ").strip()
+        print("7. Модель LLM")
+        choice = input("Выберите (1-7): ").strip()
 
         if choice == "1":
             q = input("Введите юридический вопрос: ").strip()
             if q:
-                print_result(rag.ask(q))
+                print_result(rag.ask(q, user_id="cli"))
         elif choice == "2":
             for i, ex in enumerate(examples, start=1):
                 print(f"{i}. {ex}")
@@ -1395,7 +1818,7 @@ def interactive_cli(rag: OtusStyleRAG) -> None:
             try:
                 idx = int(raw) - 1
                 if 0 <= idx < len(examples):
-                    print_result(rag.ask(examples[idx]))
+                    print_result(rag.ask(examples[idx], user_id="cli"))
                 else:
                     print("Некорректный номер")
             except ValueError:
@@ -1419,6 +1842,16 @@ def interactive_cli(rag: OtusStyleRAG) -> None:
             if weights:
                 rag.set_source_weights(weights)
                 print(f"Веса обновлены: {rag.source_weights}")
+        elif choice == "7":
+            print(f"Текущая модель: {rag.llm_model}")
+            print("Доступные модели: " + ", ".join(sorted(ALLOWED_LLM_MODELS)))
+            raw = input("Введите модель или Enter: ").strip()
+            if raw:
+                try:
+                    rag.set_llm_model(raw)
+                    print(f"Модель обновлена: {rag.llm_model}")
+                except ValueError as exc:
+                    print(str(exc))
         else:
             print("Некорректный выбор")
 
@@ -1436,6 +1869,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--source-mode", default=None, choices=sorted(SOURCE_MODES))
     parser.add_argument("--source-weights", default=None)
+    parser.add_argument("--llm-model", default=None, help="LLM model (e.g., gpt-4.1-mini)")
     parser.add_argument("--tg-bot", action="store_true", help="Запустить Telegram-бота")
     args = parser.parse_args()
 
@@ -1447,6 +1881,7 @@ def main() -> None:
         textbook_index_name=args.textbook_index_name,
         source_mode=args.source_mode,
         source_weights=args.source_weights,
+        llm_model=args.llm_model,
     )
 
     if args.tg_bot:
@@ -1454,7 +1889,7 @@ def main() -> None:
         return
 
     if args.query:
-        print_result(rag.ask(args.query, top_k=args.top_k))
+        print_result(rag.ask(args.query, top_k=args.top_k, user_id="cli"))
     else:
         interactive_cli(rag)
 
